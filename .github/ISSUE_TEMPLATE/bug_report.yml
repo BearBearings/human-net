@@ -1,0 +1,8 @@
+name: Bug report
+description: Report a bug
+labels: [type:bug]
+body:
+  - type: textarea
+    id: desc
+    attributes: {label: Description}
+    validations: {required: true}

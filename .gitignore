@@ -1,0 +1,8 @@
+.DS_Store
+/target/
+/Cargo.lock
+node_modules/
+/dist/
+__pycache__/
+.env
+.env.*

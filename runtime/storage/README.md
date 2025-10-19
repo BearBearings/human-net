@@ -1,0 +1,1 @@
+# Vault layout docs (placeholders)

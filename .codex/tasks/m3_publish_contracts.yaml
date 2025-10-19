@@ -1,0 +1,29 @@
+name: M3 — Publish & Contracts
+objectives:
+  - Shard publish (CBOR) with mini-index + ETag
+  - Market fan-out search; shard server; discovery integration
+  - State/events (pricing, inventory) + reducers
+  - Contracts FSM (MCP): propose/accept/reserve/fulfill (+ proofs)
+steps:
+  - path: docs/spec/shard@1.md
+    action: write
+    details: header, summaries, mini-index (Bloom/postings), visibility
+  - path: services/shard-server/
+    action: scaffold
+    details: serve shards + ETag; peers index; LAN advertise
+  - path: docs/spec/contract@1_fsm.md
+    action: write
+    details: events, signatures, versioned RESERVE semantics
+  - path: services/mcp/
+    action: scaffold
+    details: HTTP/WS endpoints; idempotent; policy checks
+  - path: cli/src/bin/contract.rs
+    action: scaffold
+    details: propose|get|list|accept|fulfill|verify
+  - path: cli/src/bin/view.rs
+    action: patch
+    details: add `publish` subverb → shard
+acceptance:
+  - "Shard discovery + query < 300 ms on LAN"
+  - "End-to-end contract verifies; oversell prevented by versioned RESERVE"
+  - "Price/stock deltas reflected via shard ETag updates"

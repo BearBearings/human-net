@@ -1,0 +1,32 @@
+name: M2 — Units & Views
+objectives:
+  - Units CRUD + verification + importers (CSV/JSONL/XLSX)
+  - Local indexer (SQLite+FTS); rule grammar v1
+  - Views (static|dynamic|ephemeral), link/run/rows/snapshot/delete
+  - GC policy & tool
+steps:
+  - path: docs/spec/unit@1.md
+    action: write
+    details: Canonical fields, signing, file refs
+  - path: docs/spec/view@1.md
+    action: write
+    details: mode, sources, rule, retention, visibility
+  - path: runtime/rule-grammar.md
+    action: write
+    details: type/labels/range/text/geo.within; deterministic
+  - path: cli/src/bin/unit.rs
+    action: scaffold
+    details: create|import|get|list|delete|verify
+  - path: cli/src/bin/view.rs
+    action: scaffold
+    details: create|link|run|rows|get|list|snapshot|delete|exec
+  - path: services/indexer/
+    action: scaffold
+    details: FTS tables; background refresh; API /v1/search
+  - path: cli/src/bin/gc.rs
+    action: scaffold
+    details: gc run|dry-run|set; TTL/LRU/snapshot retention
+acceptance:
+  - "50k units → query P95 < 150 ms"
+  - "view snapshot is immutable & verifiable"
+  - "ephemeral views auto-GC respecting TTL/LRU"

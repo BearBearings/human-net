@@ -1,0 +1,25 @@
+name: M1 — Identity & Peer Network
+objectives:
+  - Implement L1 DID create/use/verify/export/recover
+  - Start discovery service; list/get peers
+  - Policy skeleton & service controls
+steps:
+  - path: docs/spec/id@1.md
+    action: write
+    details: Define DID format (Ed25519 + JCS), profile@1, credential hooks
+  - path: cli/src/bin/id.rs
+    action: scaffold
+    details: Subcommands create|use|get|list|verify|export|recover; -o/--dry-run/--yes
+  - path: services/discovery/
+    action: scaffold
+    details: mDNS announcer/resolver; health endpoint; peer table
+  - path: cli/src/bin/service.rs
+    action: scaffold
+    details: start|stop|status|logs — discovery only in M1
+  - path: docs/spec/policy@1.md
+    action: write
+    details: Consent gates; keys & storage; banner requirements
+acceptance:
+  - "Two nodes discover via `hn peer list` in <2s on LAN"
+  - "`hn id export` → `hn id recover` succeeds"
+  - "All writes support --dry-run and -o json"
