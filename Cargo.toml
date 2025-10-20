@@ -1,0 +1,6 @@
+[workspace]
+members = [
+  "cli",
+  "services/discovery"
+]
+resolver = "2"

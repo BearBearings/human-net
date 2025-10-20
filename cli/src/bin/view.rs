@@ -1,2 +1,4 @@
 // view subcommand placeholder
-fn main() { println!("hn view (placeholder)"); }
+fn main() {
+    println!("hn view (placeholder)");
+}
