@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://human.net/schemas/file@1.json",
+  "title": "file@1",
+  "type": "object",
+  "required": ["path", "hash"],
+  "properties": {
+    "path": {
+      "type": "string",
+      "description": "Relative path of the file within the doc context"
+    },
+    "hash": {
+      "type": "string",
+      "description": "Content hash (blake3 hex or equivalent)",
+      "minLength": 64,
+      "maxLength": 64
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Optional metadata key/value pairs"
+    }
+  },
+  "additionalProperties": true
+}

@@ -1,13 +1,17 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use dialoguer::Confirm;
 use serde_json::json;
+use std::fs;
+use std::path::PathBuf;
 use time::OffsetDateTime;
 
 use hn_cli::home::ensure_home_dir;
 use hn_cli::identity::IdentityVault;
 use hn_cli::output::{CommandOutput, OutputFormat};
-use hn_cli::policy::{GateMode, PolicyDocument, PolicyGate, PolicyStore};
+use hn_cli::policy::{
+    GateMode, PolicyDecision, PolicyDocument, PolicyEvaluator, PolicyGate, PolicyStore,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -69,6 +73,16 @@ enum Commands {
         /// Disable auditing for the specified gate.
         #[arg(long = "no-audit", value_name = "GATE")]
         no_audit: Vec<String>,
+    },
+    /// Evaluate whether a doc write would be allowed.
+    EvaluateDoc {
+        /// Doc type identifier (e.g. folder@1).
+        #[arg(long = "type", value_name = "TYPE")]
+        doc_type: String,
+
+        /// Path to the doc JSON payload.
+        #[arg(long = "file", value_name = "PATH")]
+        file: Option<PathBuf>,
     },
 }
 
@@ -139,6 +153,9 @@ fn main() -> Result<()> {
             &audit,
             &no_audit,
         ),
+        Commands::EvaluateDoc { doc_type, file } => {
+            handle_evaluate_doc(&ctx, &vault, &store, doc_type, file)
+        }
     }?;
 
     output.render(ctx.output)?;
@@ -260,6 +277,44 @@ fn handle_patch(
             "new_version": policy.version,
         }),
     ))
+}
+
+fn handle_evaluate_doc(
+    ctx: &CommandContext,
+    vault: &IdentityVault,
+    store: &PolicyStore,
+    doc_type: String,
+    file: Option<PathBuf>,
+) -> Result<CommandOutput> {
+    let content = if let Some(path) = file {
+        let data = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+        serde_json::from_slice(&data)
+            .with_context(|| format!("failed to parse {}", path.display()))?
+    } else {
+        serde_json::json!({})
+    };
+
+    let decision = PolicyEvaluator::doc_write_decision(vault, store.alias(), &doc_type, &content)?;
+    let payload = json!({
+        "command": "evaluate_doc",
+        "mode": ctx.read_mode(),
+        "doc_type": doc_type,
+        "decision": match &decision {
+            PolicyDecision::Allow => "allow",
+            PolicyDecision::Deny(_) => "deny",
+        },
+        "reason": match &decision {
+            PolicyDecision::Allow => None,
+            PolicyDecision::Deny(reason) => Some(reason.clone()),
+        },
+    });
+
+    let message = match decision {
+        PolicyDecision::Allow => "doc.write allowed".to_string(),
+        PolicyDecision::Deny(reason) => format!("doc.write denied: {reason}"),
+    };
+
+    Ok(CommandOutput::new(message, payload))
 }
 
 fn apply_set(entry: &str, policy: &mut PolicyDocument, changes: &mut Vec<String>) -> Result<()> {

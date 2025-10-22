@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://human.net/schemas/doc@1.json",
+  "title": "doc@1",
+  "type": "object",
+  "required": ["type", "content"],
+  "properties": {
+    "type": {
+      "type": "string",
+      "description": "Doc subtype identifier such as file@1, folder@1, note@1"
+    },
+    "content": {
+      "description": "Opaque microdocument payload",
+      "type": "object"
+    }
+  },
+  "additionalProperties": true
+}

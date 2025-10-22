@@ -1,0 +1,17 @@
+{
+  "name": "Finance 2024",
+  "description": "Statements and receipts for 2024",
+  "tags": ["finance", "2024"],
+  "items": [
+    {
+      "type": "file@1",
+      "path": "receipts/january/invoice-001.pdf",
+      "hash": "b2f4b64f5f4d1f4a8fbc24b8c61f1ef5"
+    },
+    {
+      "type": "file@1",
+      "path": "receipts/february/invoice-014.pdf",
+      "hash": "8e3cd4226d837e5d1b6f95028e90f3a2"
+    }
+  ]
+}

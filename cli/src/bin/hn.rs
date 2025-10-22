@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::{exit, Command};
 
 const SUBCOMMANDS: &[&str] = &[
-    "id", "service", "peer", "policy", "unit", "view", "contract", "event", "gc", "shard", "state",
+    "id", "doc", "service", "peer", "policy", "view", "contract", "event", "gc", "shard", "state",
     "smoke",
 ];
 

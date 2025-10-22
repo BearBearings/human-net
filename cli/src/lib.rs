@@ -1,3 +1,4 @@
+pub mod doc;
 pub mod home;
 pub mod identity;
 pub mod output;

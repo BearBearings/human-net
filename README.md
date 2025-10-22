@@ -51,3 +51,41 @@ hn smoke m1
 
 This command is non-destructive (it uses ephemeral directories) and is the
 recommended regression check before committing M1 changes.
+
+## M2 quickstart (Docs, Policies, Views)
+
+1. Create/activate an identity (or reuse one from M1).
+2. Seed policy, then sign/import docs:
+   ```bash
+   hn policy get > /dev/null
+   # allow only folder@1 reads/writes
+   cat <<'JSON' > ~/.human-net/nodes/alice/policy/policy@1.json
+   {
+     "version": 1,
+     "gates": {
+       "doc.write": { "mode": "allow", "conditions": "type=folder@1" },
+       "doc.read":  { "mode": "allow", "conditions": "type=folder@1" }
+     },
+     "last_applied": "2025-01-01T00:00:00Z",
+     "banners": {}
+   }
+   JSON
+
+   hn doc import --type folder@1 --file samples/docs/folder.json --id finance-folder
+   hn doc replay finance-folder
+   ```
+3. Evaluate policy denials / reads:
+   ```bash
+   hn doc import --type note@1 --file samples/docs/folder.json --id note-doc
+   hn policy evaluate-doc --type note@1 --file samples/docs/folder.json
+   ```
+4. Create and run views (HQL-0 rules):
+   ```bash
+   hn doc view create finance --rule 'type=folder@1 AND tags:"finance"'
+   hn doc view rows finance -o json
+   hn doc view snapshot finance
+   ```
+5. Everything above is automated via:
+   ```bash
+   hn smoke m2
+   ```

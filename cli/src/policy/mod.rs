@@ -13,6 +13,7 @@ const POLICY_FILE: &str = "policy@1.json";
 const POLICY_LOG: &str = "log.jsonl";
 
 pub struct PolicyStore {
+    alias: String,
     policy_path: PathBuf,
     log_path: PathBuf,
 }
@@ -22,7 +23,11 @@ impl PolicyStore {
         let active = vault
             .active_identity()?
             .ok_or_else(|| anyhow!("no active identity selected; run `hn id use <alias>`"))?;
-        let dir = vault.ensure_policy_dir_for(&active.alias)?;
+        Self::for_alias(vault, &active.alias)
+    }
+
+    pub fn for_alias(vault: &IdentityVault, alias: &str) -> Result<Self> {
+        let dir = vault.ensure_policy_dir_for(alias)?;
         let policy_path = dir.join(POLICY_FILE);
         let log_path = dir.join(POLICY_LOG);
         if !policy_path.exists() {
@@ -34,6 +39,7 @@ impl PolicyStore {
                 .with_context(|| format!("failed to create {}", log_path.display()))?;
         }
         Ok(Self {
+            alias: alias.to_string(),
             policy_path,
             log_path,
         })
@@ -77,6 +83,10 @@ impl PolicyStore {
         file.write_all(line.as_bytes())?;
         Ok(())
     }
+
+    pub fn alias(&self) -> &str {
+        &self.alias
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,20 +106,12 @@ impl Default for PolicyDocument {
         let now = OffsetDateTime::now_utc();
         let mut gates = BTreeMap::new();
         gates.insert(
-            "units.write".to_string(),
-            PolicyGate::new(GateMode::Prompt, Some("true".to_string()), true),
+            "doc.write".to_string(),
+            PolicyGate::new(GateMode::Allow, None, true),
         );
         gates.insert(
-            "contracts.propose".to_string(),
-            PolicyGate::new(GateMode::Prompt, Some("true".to_string()), true),
-        );
-        gates.insert(
-            "contracts.fulfill".to_string(),
-            PolicyGate::new(GateMode::Deny, Some("true".to_string()), true),
-        );
-        gates.insert(
-            "spend.max_eur".to_string(),
-            PolicyGate::new(GateMode::Allow, Some("value <= 0".to_string()), false),
+            "doc.read".to_string(),
+            PolicyGate::new(GateMode::Allow, Some("type=*".to_string()), false),
         );
         Self {
             version: 1,
@@ -118,6 +120,151 @@ impl Default for PolicyDocument {
             applied_by: None,
             banners: BTreeMap::new(),
         }
+    }
+}
+
+#[derive(Clone)]
+pub enum PolicyDecision {
+    Allow,
+    Deny(String),
+}
+
+pub struct PolicyEvaluator;
+
+impl PolicyEvaluator {
+    pub fn check_doc_write(
+        vault: &IdentityVault,
+        alias: &str,
+        doc_type: &str,
+        _content: &serde_json::Value,
+    ) -> Result<()> {
+        match Self::doc_write_decision(vault, alias, doc_type, _content)? {
+            PolicyDecision::Allow => Ok(()),
+            PolicyDecision::Deny(reason) => Err(anyhow!(reason)),
+        }
+    }
+
+    pub fn doc_write_decision(
+        vault: &IdentityVault,
+        alias: &str,
+        doc_type: &str,
+        content: &serde_json::Value,
+    ) -> Result<PolicyDecision> {
+        let _ = content; // reserved for future content-based rules
+        let store = PolicyStore::for_alias(vault, alias)?;
+        store.evaluate_doc_write(doc_type)
+    }
+
+    pub fn check_doc_read(
+        vault: &IdentityVault,
+        alias: &str,
+        doc_type: &str,
+        content: &serde_json::Value,
+    ) -> Result<()> {
+        match Self::doc_read_decision(vault, alias, doc_type, content)? {
+            PolicyDecision::Allow => Ok(()),
+            PolicyDecision::Deny(reason) => Err(anyhow!(reason)),
+        }
+    }
+
+    pub fn doc_read_decision(
+        vault: &IdentityVault,
+        alias: &str,
+        doc_type: &str,
+        content: &serde_json::Value,
+    ) -> Result<PolicyDecision> {
+        let _ = content;
+        let store = PolicyStore::for_alias(vault, alias)?;
+        store.evaluate_doc_read(doc_type)
+    }
+}
+
+impl PolicyStore {
+    pub fn evaluate_doc_write(&self, doc_type: &str) -> Result<PolicyDecision> {
+        let policy = self.load()?;
+        if let Some(gate) = policy.gates.get("doc.write") {
+            match gate.mode {
+                GateMode::Deny => {
+                    return Ok(PolicyDecision::Deny(format!(
+                        "policy denied doc.write for type '{}'",
+                        doc_type
+                    )))
+                }
+                GateMode::Prompt => {
+                    return Ok(PolicyDecision::Deny(format!(
+                        "policy requires confirmation for doc.write type '{}'",
+                        doc_type
+                    )))
+                }
+                GateMode::Allow => {
+                    if Self::matches_conditions(gate, doc_type) {
+                        Ok(PolicyDecision::Allow)
+                    } else {
+                        Ok(PolicyDecision::Deny(format!(
+                            "policy blocked doc.write; type '{}' not permitted",
+                            doc_type
+                        )))
+                    }
+                }
+            }
+        } else {
+            Ok(PolicyDecision::Allow)
+        }
+    }
+
+    pub fn evaluate_doc_read(&self, doc_type: &str) -> Result<PolicyDecision> {
+        let policy = self.load()?;
+        if let Some(gate) = policy.gates.get("doc.read") {
+            match gate.mode {
+                GateMode::Deny => {
+                    return Ok(PolicyDecision::Deny(format!(
+                        "policy denied doc.read for type '{}'",
+                        doc_type
+                    )))
+                }
+                GateMode::Prompt => {
+                    return Ok(PolicyDecision::Deny(format!(
+                        "policy requires confirmation for doc.read type '{}'",
+                        doc_type
+                    )))
+                }
+                GateMode::Allow => {
+                    if Self::matches_conditions(gate, doc_type) {
+                        Ok(PolicyDecision::Allow)
+                    } else {
+                        Ok(PolicyDecision::Deny(format!(
+                            "policy blocked doc.read; type '{}' not permitted",
+                            doc_type
+                        )))
+                    }
+                }
+            }
+        } else {
+            Ok(PolicyDecision::Allow)
+        }
+    }
+
+    fn matches_conditions(gate: &PolicyGate, doc_type: &str) -> bool {
+        let Some(ref cond) = gate.conditions else {
+            return true;
+        };
+        if cond.trim().is_empty() {
+            return true;
+        }
+        let mut allowed = false;
+        for token in cond.split(',') {
+            let token = token.trim();
+            if token.is_empty() {
+                continue;
+            }
+            if let Some(rest) = token.strip_prefix("type=") {
+                if rest.trim() == "*" || rest.trim() == doc_type {
+                    allowed = true;
+                    break;
+                }
+            }
+        }
+        allowed
     }
 }
 
