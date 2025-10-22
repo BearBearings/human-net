@@ -1,5 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use dialoguer::Confirm;
 use serde_json::json;
 use std::fs;
@@ -84,6 +84,9 @@ enum Commands {
         #[arg(long = "file", value_name = "PATH")]
         file: Option<PathBuf>,
     },
+    /// Focused helpers for individual gate updates.
+    #[command(subcommand)]
+    Gate(GateCommands),
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -91,6 +94,42 @@ enum ModeSetting {
     Allow,
     Deny,
     Prompt,
+}
+
+#[derive(Subcommand, Debug)]
+enum GateCommands {
+    /// Update a single policy gate in-place.
+    Set(GateSetArgs),
+}
+
+#[derive(Args, Debug)]
+struct GateSetArgs {
+    /// Gate identifier to update (e.g. offer.create).
+    gate: String,
+
+    /// Replace the gate condition expression.
+    #[arg(long = "conditions", value_name = "EXPR")]
+    conditions: Option<String>,
+
+    /// Set the gate mode.
+    #[arg(long = "mode", value_name = "MODE")]
+    mode: Option<ModeSetting>,
+
+    /// Enable auditing for this gate.
+    #[arg(long = "audit")]
+    audit: bool,
+
+    /// Disable auditing for this gate.
+    #[arg(long = "no-audit")]
+    no_audit: bool,
+
+    /// Set or replace the gate banner message.
+    #[arg(long = "banner", value_name = "TEXT")]
+    banner: Option<String>,
+
+    /// Clear any existing banner.
+    #[arg(long = "clear-banner")]
+    clear_banner: bool,
 }
 
 impl From<ModeSetting> for GateMode {
@@ -156,6 +195,9 @@ fn main() -> Result<()> {
         Commands::EvaluateDoc { doc_type, file } => {
             handle_evaluate_doc(&ctx, &vault, &store, doc_type, file)
         }
+        Commands::Gate(sub) => match sub {
+            GateCommands::Set(args) => handle_gate_set(&ctx, &store, &vault, args),
+        },
     }?;
 
     output.render(ctx.output)?;
@@ -315,6 +357,126 @@ fn handle_evaluate_doc(
     };
 
     Ok(CommandOutput::new(message, payload))
+}
+
+fn handle_gate_set(
+    ctx: &CommandContext,
+    store: &PolicyStore,
+    vault: &IdentityVault,
+    args: GateSetArgs,
+) -> Result<CommandOutput> {
+    let mut policy = store.load()?;
+    let gate_name = args.gate.trim();
+    if gate_name.is_empty() {
+        bail!("gate name cannot be empty");
+    }
+    let gate = ensure_gate(&mut policy, gate_name);
+    let mut changes: Vec<String> = Vec::new();
+
+    if let Some(conditions) = args.conditions.as_ref().map(|c| c.trim().to_string()) {
+        gate.conditions = if conditions.is_empty() {
+            None
+        } else {
+            Some(conditions.clone())
+        };
+        changes.push(format!("{}.conditions -> {}", gate_name, conditions));
+    }
+
+    if let Some(mode) = args.mode {
+        gate.mode = mode.into();
+        let mode_str = match mode {
+            ModeSetting::Allow => "allow",
+            ModeSetting::Deny => "deny",
+            ModeSetting::Prompt => "prompt",
+        };
+        changes.push(format!("{}.mode -> {}", gate_name, mode_str));
+    }
+
+    if args.audit && args.no_audit {
+        bail!("use either --audit or --no-audit, not both");
+    }
+    if args.audit {
+        if !gate.audit {
+            gate.audit = true;
+            changes.push(format!("{}.audit -> true", gate_name));
+        }
+    } else if args.no_audit {
+        if gate.audit {
+            gate.audit = false;
+            changes.push(format!("{}.audit -> false", gate_name));
+        }
+    }
+
+    if args.clear_banner {
+        if gate.banner.take().is_some() {
+            changes.push(format!("{}.banner cleared", gate_name));
+        }
+    }
+    if let Some(text) = &args.banner {
+        gate.banner = Some(text.clone());
+        changes.push(format!("{}.banner -> set", gate_name));
+    }
+
+    if changes.is_empty() {
+        return Ok(CommandOutput::new(
+            format!("No updates applied to gate '{}'", gate_name),
+            json!({
+                "command": "gate.set",
+                "mode": ctx.read_mode(),
+                "gate": gate_name,
+                "changes": Vec::<String>::new(),
+            }),
+        ));
+    }
+
+    if ctx.dry_run {
+        return Ok(CommandOutput::new(
+            format!(
+                "(dry-run) {} change(s) would be applied to gate '{}'",
+                changes.len(),
+                gate_name
+            ),
+            json!({
+                "command": "gate.set",
+                "mode": "dry_run",
+                "gate": gate_name,
+                "changes": changes,
+                "policy": serde_json::to_value(&policy)?,
+            }),
+        ));
+    }
+
+    ensure_confirmation(
+        ctx,
+        &format!(
+            "Apply {} change(s) to gate '{}' ?",
+            changes.len(),
+            gate_name
+        ),
+    )?;
+
+    let previous_version = policy.version;
+    policy.version = policy.version.saturating_add(1);
+    policy.last_applied = OffsetDateTime::now_utc();
+    policy.applied_by = vault.active_identity()?.map(|active| active.did);
+    store.save(&policy)?;
+
+    Ok(CommandOutput::new(
+        format!(
+            "Updated gate '{}' with {} change(s)",
+            gate_name,
+            changes.len()
+        ),
+        json!({
+            "command": "gate.set",
+            "mode": "execute",
+            "gate": gate_name,
+            "changes": changes,
+            "previous_version": previous_version,
+            "new_version": policy.version,
+            "policy": serde_json::to_value(&policy)?,
+        }),
+    ))
 }
 
 fn apply_set(entry: &str, policy: &mut PolicyDocument, changes: &mut Vec<String>) -> Result<()> {

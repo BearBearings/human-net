@@ -113,6 +113,14 @@ impl Default for PolicyDocument {
             "doc.read".to_string(),
             PolicyGate::new(GateMode::Allow, Some("type=*".to_string()), false),
         );
+        gates.insert(
+            "offer.create".to_string(),
+            PolicyGate::new(GateMode::Allow, Some("provider=*".to_string()), false),
+        );
+        gates.insert(
+            "contract.accept".to_string(),
+            PolicyGate::new(GateMode::Allow, Some("provider=*".to_string()), false),
+        );
         Self {
             version: 1,
             gates,
@@ -176,6 +184,19 @@ impl PolicyEvaluator {
         let _ = content;
         let store = PolicyStore::for_alias(vault, alias)?;
         store.evaluate_doc_read(doc_type)
+    }
+
+    pub fn check_provider_gate(
+        vault: &IdentityVault,
+        alias: &str,
+        gate: &str,
+        provider: &str,
+    ) -> Result<()> {
+        let store = PolicyStore::for_alias(vault, alias)?;
+        match store.evaluate_provider_gate(gate, provider)? {
+            PolicyDecision::Allow => Ok(()),
+            PolicyDecision::Deny(reason) => Err(anyhow!(reason)),
+        }
     }
 }
 
@@ -266,6 +287,37 @@ impl PolicyStore {
         }
         allowed
     }
+
+    pub fn evaluate_provider_gate(
+        &self,
+        gate_name: &str,
+        provider: &str,
+    ) -> Result<PolicyDecision> {
+        let policy = self.load()?;
+        let Some(gate) = policy.gates.get(gate_name) else {
+            return Ok(PolicyDecision::Allow);
+        };
+        match gate.mode {
+            GateMode::Deny => Ok(PolicyDecision::Deny(format!(
+                "policy gate '{}' denied for provider '{}'",
+                gate_name, provider
+            ))),
+            GateMode::Prompt => Ok(PolicyDecision::Deny(format!(
+                "policy gate '{}' requires confirmation for provider '{}'",
+                gate_name, provider
+            ))),
+            GateMode::Allow => {
+                if matches_provider(gate, provider) {
+                    Ok(PolicyDecision::Allow)
+                } else {
+                    Ok(PolicyDecision::Deny(format!(
+                        "policy gate '{}' does not allow provider '{}'",
+                        gate_name, provider
+                    )))
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -331,4 +383,29 @@ fn write_policy(path: &Path, document: &PolicyDocument) -> Result<()> {
     fs::rename(&tmp, path)
         .with_context(|| format!("failed to move {} into place", tmp.display()))?;
     Ok(())
+}
+
+fn matches_provider(gate: &PolicyGate, provider: &str) -> bool {
+    let Some(ref cond) = gate.conditions else {
+        return true;
+    };
+    if cond.trim().is_empty() {
+        return true;
+    }
+    let provider = provider.trim();
+    for token in cond.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        if let Some(rest) = token.strip_prefix("provider=") {
+            for candidate in rest.split('|') {
+                let candidate = candidate.trim();
+                if candidate == "*" || candidate.eq_ignore_ascii_case(provider) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }

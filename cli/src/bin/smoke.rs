@@ -20,12 +20,16 @@ struct Cli {
 enum Commands {
     /// Validate the M1 identity + discovery flow (Alice/Bob LAN discovery).
     M1,
+
+    /// Run the M3 exchange flow (offer → contract → shard replay).
+    M3,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::M1 => run_m1(),
+        Commands::M3 => run_m3(),
     }
 }
 
@@ -117,6 +121,25 @@ fn run_m1() -> Result<()> {
     }
 
     result
+}
+
+fn run_m3() -> Result<()> {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let script = repo_root.join("tooling/scripts/m3-test.sh");
+    let status = Command::new("bash")
+        .arg(&script)
+        .current_dir(&repo_root)
+        .status()
+        .with_context(|| format!("failed to execute {}", script.display()))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "m3 smoke test failed with status {:?}",
+            status.code()
+        ))
+    }
 }
 
 fn wait_for_peer(hn: &Path, home: &Path, expected_alias: &str) -> Result<()> {

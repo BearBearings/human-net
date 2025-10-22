@@ -38,6 +38,16 @@ impl<'a> DocStore<'a> {
         })
     }
 
+    pub fn for_alias(vault: &'a IdentityVault, alias: &str) -> Result<Self> {
+        let identity = vault.load_identity(alias)?;
+        Ok(Self {
+            vault,
+            alias: alias.to_string(),
+            did: identity.profile.id.clone(),
+            identity,
+        })
+    }
+
     pub fn import_from_file(
         &self,
         doc_type: &str,

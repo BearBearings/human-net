@@ -10,8 +10,12 @@ use serde_json::{json, Value};
 type EndpointsMap = HashMap<String, Value>;
 
 use hn_cli::home::ensure_home_dir;
-use hn_cli::identity::{IdentityBundle, IdentityVault};
+use hn_cli::identity::{
+    BuiltinVerifier, IdentityBundle, IdentityVault, IdentityVerificationEntry, VerificationRequest,
+    VerificationResult,
+};
 use hn_cli::output::{CommandOutput, OutputFormat};
+use time::{Duration, OffsetDateTime};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -76,15 +80,33 @@ enum Commands {
         #[arg(long)]
         include_archived: bool,
     },
-    /// Verify DID document integrity and credential hooks.
+    /// Verify DID document integrity and refresh L2 credentials.
     Verify {
         /// Alias or DID (defaults to active identity).
         #[arg(value_name = "ALIAS|DID")]
         target: Option<String>,
 
-        /// Skip credential hook execution (stub).
+        /// Verification provider to use (mock-entra, mock-didkit).
+        #[arg(long, value_name = "NAME", default_value = "mock-entra")]
+        provider: String,
+
+        /// Force re-fetch even if cache is still fresh.
+        #[arg(long)]
+        force: bool,
+
+        /// Skip remote provider call; run integrity checks only.
         #[arg(long)]
         skip_credentials: bool,
+    },
+    /// Show verification cache status.
+    Status {
+        /// Alias or DID (defaults to active identity).
+        #[arg(value_name = "ALIAS|DID")]
+        target: Option<String>,
+
+        /// Limit to a specific verification provider.
+        #[arg(long, value_name = "NAME")]
+        provider: Option<String>,
     },
     /// Export an identity bundle that can be recovered elsewhere.
     Export {
@@ -183,8 +205,11 @@ fn main() -> Result<()> {
         Commands::List { include_archived } => handle_list(&ctx, &vault, include_archived),
         Commands::Verify {
             target,
+            provider,
+            force,
             skip_credentials,
-        } => handle_verify(&ctx, &vault, target, skip_credentials),
+        } => handle_verify(&ctx, &vault, target, provider, force, skip_credentials),
+        Commands::Status { target, provider } => handle_status(&ctx, &vault, target, provider),
         Commands::Export {
             target,
             file,
@@ -286,19 +311,38 @@ fn handle_get(
     };
     let record = vault.load_identity(&alias)?;
 
+    let mut identity_value = json!({
+        "alias": record.profile.alias,
+        "did": record.profile.id,
+        "capabilities": record.profile.capabilities,
+        "endpoints": record.profile.endpoints,
+        "created_at": record.profile.created_at,
+        "updated_at": record.profile.updated_at,
+    });
+    if let Some(obj) = identity_value.as_object_mut() {
+        obj.insert(
+            "hpke".into(),
+            json!({
+                "public_key": record.keys.hpke_public_key_base64(),
+                "suite": "X25519HkdfSha256",
+            }),
+        );
+    }
+    if with_credentials {
+        if let Some(obj) = identity_value.as_object_mut() {
+            obj.insert(
+                "verification".into(),
+                serde_json::to_value(&record.profile.verification)?,
+            );
+        }
+    }
+
     Ok(CommandOutput::new(
         format!("Identity '{alias}'"),
         json!({
             "command": "get",
             "mode": ctx.read_mode(),
-            "identity": {
-                "alias": record.profile.alias,
-                "did": record.profile.id,
-                "capabilities": record.profile.capabilities,
-                "endpoints": record.profile.endpoints,
-                "created_at": record.profile.created_at,
-                "updated_at": record.profile.updated_at,
-            },
+            "identity": identity_value,
             "with_credentials": with_credentials,
         }),
     ))
@@ -342,6 +386,8 @@ fn handle_verify(
     ctx: &CommandContext,
     vault: &IdentityVault,
     target: Option<String>,
+    provider: String,
+    force: bool,
     skip_credentials: bool,
 ) -> Result<CommandOutput> {
     let alias = match target {
@@ -351,7 +397,7 @@ fn handle_verify(
             .map(|active| active.alias)
             .context("no active identity; specify an alias or DID")?,
     };
-    let record = vault.load_identity(&alias)?;
+    let mut record = vault.load_identity(&alias)?;
 
     let computed_did = record.keys.did();
     let doc_did_match = record.did_document.id == computed_did;
@@ -360,22 +406,230 @@ fn handle_verify(
     let stored_hash = record.canonical_hash.clone();
     let canonical_match = stored_hash.as_deref() == Some(canonical.as_str());
 
-    let credentials_checked = !skip_credentials;
+    let provider_trimmed = provider.trim().to_string();
+    let refresh_window = Duration::hours(6);
+    let refresh_hint = record.profile.verification.needs_refresh(
+        &provider_trimmed,
+        OffsetDateTime::now_utc(),
+        refresh_window,
+    );
 
-    Ok(CommandOutput::new(
-        format!("Verification for '{alias}'"),
-        json!({
-            "command": "verify",
-            "mode": ctx.read_mode(),
-            "alias": alias,
-            "checks": {
-                "did_document_match": doc_did_match,
-                "profile_did_match": profile_did_match,
-                "canonical_hash_match": canonical_match,
-                "credentials_checked": credentials_checked,
+    let (verification_details, message) = if skip_credentials {
+        let detail = json!({
+            "skipped": true,
+            "requested_provider": provider_trimmed,
+            "force": force,
+            "refresh_window_seconds": refresh_window.whole_seconds(),
+            "refresh_needed": refresh_hint,
+            "dry_run": ctx.dry_run,
+        });
+        (
+            detail,
+            format!("Integrity check for '{alias}' (provider skipped)"),
+        )
+    } else {
+        let builtin = BuiltinVerifier::from_str(&provider_trimmed).with_context(|| {
+            let supported = BuiltinVerifier::all()
+                .iter()
+                .map(|candidate| candidate.name())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "unknown verification provider '{}'; available: {}",
+                provider_trimmed, supported
+            )
+        })?;
+        let verifier = builtin.build();
+        let existing_entry = record.profile.verification.entry(builtin.name()).cloned();
+        let request =
+            VerificationRequest::new(record.profile.alias.clone(), record.profile.id.clone())
+                .with_existing(existing_entry.clone())
+                .force_refresh(force);
+        let VerificationResult {
+            entry,
+            proof,
+            refreshed,
+        } = verifier.verify(&request)?;
+        let persisted = !ctx.dry_run && refreshed;
+        if persisted {
+            vault.record_verification(&mut record, entry.clone(), proof.clone())?;
+        }
+        let mut detail = serde_json::to_value(&entry)?;
+        if let Some(obj) = detail.as_object_mut() {
+            obj.insert("requested_provider".into(), json!(provider_trimmed));
+            obj.insert("refreshed".into(), json!(refreshed));
+            obj.insert("persisted".into(), json!(persisted));
+            obj.insert("force".into(), json!(force));
+            obj.insert("dry_run".into(), json!(ctx.dry_run));
+            obj.insert(
+                "refresh_window_seconds".into(),
+                json!(refresh_window.whole_seconds()),
+            );
+            obj.insert("refresh_needed".into(), json!(refresh_hint));
+            if let Some(existing) = existing_entry {
+                obj.insert("existing_entry".into(), serde_json::to_value(existing)?);
             }
-        }),
-    ))
+            if let Some(proof) = proof.as_ref() {
+                obj.insert("proof_summary".into(), proof.summary());
+            }
+        }
+
+        let provider_display = entry.provider.clone();
+        let msg = if ctx.dry_run {
+            if refreshed {
+                format!(
+                    "Dry-run: would verify '{}' via {} and store credential",
+                    alias, provider_display
+                )
+            } else {
+                format!(
+                    "Dry-run: verification cache still valid for '{}' via {}",
+                    alias, provider_display
+                )
+            }
+        } else if refreshed {
+            format!("Verified '{}' via {}", alias, provider_display)
+        } else {
+            format!(
+                "Verification cache still valid for '{}' via {}",
+                alias, provider_display
+            )
+        };
+        (detail, msg)
+    };
+
+    let payload = json!({
+        "command": "verify",
+        "mode": ctx.read_mode(),
+        "alias": alias,
+        "checks": {
+            "did_document_match": doc_did_match,
+            "profile_did_match": profile_did_match,
+            "canonical_hash_match": canonical_match,
+            "provider_invoked": !skip_credentials,
+        },
+        "verification": verification_details,
+    });
+
+    Ok(CommandOutput::new(message, payload))
+}
+
+fn handle_status(
+    ctx: &CommandContext,
+    vault: &IdentityVault,
+    target: Option<String>,
+    provider_filter: Option<String>,
+) -> Result<CommandOutput> {
+    let alias = match target {
+        Some(target) => resolve_alias(vault, &target)?,
+        None => vault
+            .active_identity()?
+            .map(|active| active.alias)
+            .context("no active identity; specify an alias or DID")?,
+    };
+    let record = vault.load_identity(&alias)?;
+    let ledger = &record.profile.verification;
+    let policy_facts = ledger.to_policy_facts();
+    let filtered_policy_facts: Vec<_> = policy_facts
+        .iter()
+        .filter(|fact| {
+            provider_filter
+                .as_ref()
+                .map(|p| fact.provider.eq_ignore_ascii_case(p))
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect();
+
+    let entries: Vec<&IdentityVerificationEntry> = match provider_filter.as_ref() {
+        Some(filter) => ledger
+            .entries
+            .iter()
+            .filter(|entry| entry.provider.eq_ignore_ascii_case(filter))
+            .collect(),
+        None => ledger.entries.iter().collect(),
+    };
+
+    if ctx.output == OutputFormat::Text {
+        if entries.is_empty() {
+            println!("No verification entries recorded.");
+        } else {
+            for entry in &entries {
+                println!(
+                    "{} -> {} (verified {})",
+                    entry.provider, entry.issuer, entry.verified_at
+                );
+                println!("  proof {} ({})", entry.proof_id, entry.format);
+                if let Some(exp) = entry.expires_at {
+                    println!("  expires {}", exp);
+                }
+            }
+            if !filtered_policy_facts.is_empty() {
+                println!("Policy facts:");
+                for fact in &filtered_policy_facts {
+                    println!(
+                        "  {} -> {} (valid_until: {:?})",
+                        fact.provider, fact.proof_id, fact.valid_until
+                    );
+                }
+            }
+        }
+    }
+
+    let list = entries
+        .iter()
+        .map(|entry| {
+            json!({
+                "provider": entry.provider,
+                "issuer": entry.issuer,
+                "proof_id": entry.proof_id,
+                "format": entry.format,
+                "verified_at": entry.verified_at,
+                "expires_at": entry.expires_at,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let message = if entries.is_empty() {
+        if let Some(filter) = provider_filter.as_ref() {
+            format!(
+                "No verification entries found for '{}' using provider '{}'",
+                alias, filter
+            )
+        } else {
+            format!("No verification entries found for '{}'", alias)
+        }
+    } else {
+        let label = if entries.len() == 1 {
+            "entry"
+        } else {
+            "entries"
+        };
+        format!(
+            "Verification status for '{}' ({} {})",
+            alias,
+            entries.len(),
+            label
+        )
+    };
+
+    let mut payload = json!({
+        "command": "status",
+        "mode": ctx.read_mode(),
+        "alias": alias,
+        "provider_filter": provider_filter,
+        "entries": list,
+        "policy_facts": filtered_policy_facts,
+        "all_policy_facts": policy_facts,
+    });
+
+    if let Some(last) = ledger.last_refreshed_at {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("last_refreshed_at".into(), json!(last));
+        }
+    }
+
+    Ok(CommandOutput::new(message, payload))
 }
 
 fn handle_export(

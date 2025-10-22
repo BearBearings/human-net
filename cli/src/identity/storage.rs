@@ -5,16 +5,19 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 
 use super::bundle::IdentityBundle;
 use super::did::{DidDocument, IdentityKeys};
+use super::proof::IdentityProof;
+use super::verification::{IdentityVerificationEntry, IdentityVerificationLedger};
 
 const CONFIG_FILE: &str = "config.json";
 const IDENTITIES_DIR: &str = "identities";
 const NODES_DIR: &str = "nodes";
 const KEY_FILE: &str = "ed25519.key";
 const PROFILE_FILE: &str = "identity.json";
+const PROOFS_DIR: &str = "proofs";
 
 #[derive(Clone)]
 pub struct IdentityVault {
@@ -237,6 +240,69 @@ impl IdentityVault {
         Ok(())
     }
 
+    pub fn persist_identity(&self, record: &IdentityRecord) -> Result<()> {
+        self.store_identity(record)
+    }
+
+    pub fn store_proof_for(&self, alias: &str, proof: &IdentityProof) -> Result<PathBuf> {
+        let dir = self.ensure_proof_dir(alias)?;
+        let path = dir.join(proof_file_name(&proof.id));
+        write_json(&path, proof)?;
+        Ok(path)
+    }
+
+    pub fn load_proof_for(&self, alias: &str, proof_id: &str) -> Result<IdentityProof> {
+        let path = self.proof_path(alias, proof_id);
+        read_json(&path)
+    }
+
+    pub fn list_proofs_for(&self, alias: &str) -> Result<Vec<IdentityProof>> {
+        let dir = self.proof_dir(alias);
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let entries = fs::read_dir(&dir)
+            .with_context(|| format!("failed to read proofs cache {}", dir.display()))?;
+        let mut proofs = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let proof: IdentityProof = read_json(&entry.path())?;
+            proofs.push(proof);
+        }
+        proofs.sort_by(|a, b| a.provider.cmp(&b.provider));
+        Ok(proofs)
+    }
+
+    pub fn record_verification(
+        &self,
+        record: &mut IdentityRecord,
+        entry: IdentityVerificationEntry,
+        proof: Option<IdentityProof>,
+    ) -> Result<()> {
+        if let Some(proof) = proof {
+            self.store_proof_for(&record.profile.alias, &proof)?;
+        }
+        record.profile.verification.upsert(entry);
+        record.profile.updated_at = OffsetDateTime::now_utc();
+        self.store_identity(record)
+    }
+
+    pub fn needs_verification_refresh(
+        &self,
+        target: &str,
+        provider: &str,
+        within: Duration,
+    ) -> Result<bool> {
+        let record = self.load_identity(target)?;
+        Ok(record
+            .profile
+            .verification
+            .needs_refresh(provider, OffsetDateTime::now_utc(), within))
+    }
+
     pub fn alias_exists(&self, alias: &str) -> Result<bool> {
         let identity_dir = self.identity_dir(alias);
         Ok(identity_dir.exists())
@@ -374,6 +440,23 @@ impl IdentityVault {
         self.identities_path.join(alias)
     }
 
+    fn proof_dir(&self, alias: &str) -> PathBuf {
+        self.identity_dir(alias).join(PROOFS_DIR)
+    }
+
+    fn ensure_proof_dir(&self, alias: &str) -> Result<PathBuf> {
+        let dir = self.proof_dir(alias);
+        if !dir.exists() {
+            fs::create_dir_all(&dir)
+                .with_context(|| format!("failed to create {}", dir.display()))?;
+        }
+        Ok(dir)
+    }
+
+    fn proof_path(&self, alias: &str, proof_id: &str) -> PathBuf {
+        self.proof_dir(alias).join(proof_file_name(proof_id))
+    }
+
     pub fn ensure_node_home(&self, alias: &str) -> Result<PathBuf> {
         let path = self.nodes_path.join(alias);
         if !path.exists() {
@@ -419,6 +502,8 @@ pub struct IdentityProfile {
     pub endpoints: HashMap<String, serde_json::Value>,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
+    #[serde(default, skip_serializing_if = "IdentityVerificationLedger::is_empty")]
+    pub verification: IdentityVerificationLedger,
 }
 
 impl IdentityProfile {
@@ -436,6 +521,7 @@ impl IdentityProfile {
             endpoints,
             created_at: timestamp,
             updated_at: timestamp,
+            verification: IdentityVerificationLedger::default(),
         }
     }
 }
@@ -499,4 +585,9 @@ fn read_bytes(path: &Path) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     file.read_to_end(&mut buf)?;
     Ok(buf)
+}
+
+fn proof_file_name(id: &str) -> String {
+    let sanitized = id.replace([':', '/'], "_");
+    format!("{sanitized}.json")
 }

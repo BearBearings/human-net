@@ -4,7 +4,7 @@ use std::process::{exit, Command};
 
 const SUBCOMMANDS: &[&str] = &[
     "id", "doc", "service", "peer", "policy", "view", "contract", "event", "gc", "shard", "state",
-    "smoke",
+    "smoke", "audit",
 ];
 
 fn main() {

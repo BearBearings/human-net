@@ -1,8 +1,11 @@
 use anyhow::{anyhow, Result};
+use base64::engine::general_purpose::STANDARD as Base64;
+use base64::Engine as _;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519Secret};
 
 /// Holds the Ed25519 key material for an identity.
 pub struct IdentityKeys {
@@ -56,6 +59,20 @@ impl IdentityKeys {
         bs58::encode(self.public_key_bytes())
             .into_string()
             .to_lowercase()
+    }
+
+    pub fn hpke_static_secret(&self) -> X25519Secret {
+        X25519Secret::from(self.secret_key_bytes())
+    }
+
+    pub fn hpke_public_key_bytes(&self) -> [u8; 32] {
+        let secret = self.hpke_static_secret();
+        let public = X25519PublicKey::from(&secret);
+        public.to_bytes()
+    }
+
+    pub fn hpke_public_key_base64(&self) -> String {
+        Base64.encode(self.hpke_public_key_bytes())
     }
 }
 

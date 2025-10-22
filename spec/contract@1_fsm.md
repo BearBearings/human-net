@@ -1,3 +1,0 @@
-# contract@1 — FSM
-
-PROPOSE → ACCEPT/RESERVE → FULFILL (+ REP). Versioned RESERVE.

@@ -1,6 +1,9 @@
+pub mod contract;
 pub mod doc;
+pub mod event;
 pub mod home;
 pub mod identity;
 pub mod output;
 pub mod policy;
 pub mod services;
+pub mod shard;
