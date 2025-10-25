@@ -1,3 +1,0 @@
-# shard-server
-
-Scaffold placeholder.
