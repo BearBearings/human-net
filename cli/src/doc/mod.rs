@@ -1,3 +1,4 @@
+use std::convert::TryInto;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -5,12 +6,13 @@ use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::STANDARD as Base64;
 use base64::Engine;
 use blake3::Hasher;
-use ed25519_dalek::{Signer, Verifier};
+use ed25519_dalek::{Signature, Signer, Verifier};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::contract::{sanitize_component, timestamp_slug};
 use crate::identity::{IdentityRecord, IdentityVault};
 use crate::policy::{PolicyDecision, PolicyEvaluator};
 
@@ -189,6 +191,28 @@ impl<'a> DocStore<'a> {
         Ok(())
     }
 
+    pub fn apply_remote_doc(&self, doc: &StoredDoc) -> Result<DocSyncStatus> {
+        let path = self.doc_path(&doc.doc_type, &doc.id);
+        let existed = path.exists();
+        if existed {
+            let existing = self.read_file(path.clone())?;
+            if existing.canonical_hash == doc.canonical_hash {
+                return Ok(DocSyncStatus::Skipped);
+            }
+            if existing.updated_at >= doc.updated_at {
+                return Ok(DocSyncStatus::Skipped);
+            }
+        }
+        let mut clone = doc.clone();
+        clone.location = None;
+        let _ = self.write_doc(&doc.doc_type, &clone)?;
+        Ok(if existed {
+            DocSyncStatus::Updated
+        } else {
+            DocSyncStatus::Created
+        })
+    }
+
     pub fn replay(&self, doc_id: &str) -> Result<ReplayResult> {
         let (doc_type, path) = self.locate(doc_id)?;
         let stored = self.read_file(path)?;
@@ -262,6 +286,10 @@ impl<'a> DocStore<'a> {
         &self.alias
     }
 
+    pub fn identity_record(&self) -> &IdentityRecord {
+        &self.identity
+    }
+
     fn locate(&self, doc_id: &str) -> Result<(String, PathBuf)> {
         let root = self.docs_root()?;
         if !root.exists() {
@@ -303,7 +331,7 @@ struct UnsignedDoc<'a> {
     pub updated_at: OffsetDateTime,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredDoc {
     pub id: String,
     #[serde(rename = "type")]
@@ -370,6 +398,18 @@ pub struct ReplayResult {
     pub canonical_hash: String,
     pub computed_hash: String,
     pub signature_valid: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocSyncStatus {
+    Created,
+    Updated,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ViewSource {
+    Local,
 }
 
 pub struct ViewStore<'a> {
@@ -457,34 +497,145 @@ impl<'a> ViewStore<'a> {
         Ok(rows)
     }
 
-    pub fn snapshot(&self, name: &str) -> Result<ViewSnapshot> {
+    pub fn list_with_receipts(&self) -> Result<Vec<ViewSummary>> {
+        let definitions = self.list()?;
+        let mut summaries = Vec::new();
+        for def in definitions {
+            let latest_receipt = self
+                .latest_receipt_optional(&def.name)?
+                .map(ViewReceiptSummary::from_receipt);
+            summaries.push(ViewSummary {
+                name: def.name.clone(),
+                rule: def.rule.clone(),
+                created_at: def.created_at,
+                updated_at: def.updated_at,
+                latest_receipt,
+            });
+        }
+        Ok(summaries)
+    }
+
+    pub fn materialize(&self, name: &str, source: ViewSource) -> Result<ViewMaterialization> {
         let rows = self.run(name)?;
-        let timestamp = OffsetDateTime::now_utc();
-        let snapshot_core = json!({
-            "view": name,
-            "rows": rows,
-            "captured_at": timestamp,
-        });
-        let canonical = serde_jcs::to_string(&snapshot_core)?;
-        let canonical_hash = blake3::hash(canonical.as_bytes()).to_hex().to_string();
-        let snapshot = ViewSnapshot {
+        let captured_at = OffsetDateTime::now_utc();
+        let canonical_snapshot = snapshot_canonical_payload(name, &rows, captured_at)?;
+        let snapshot_hash = blake3::hash(canonical_snapshot.as_bytes())
+            .to_hex()
+            .to_string();
+
+        let mut snapshot = ViewSnapshot {
             view: name.to_string(),
-            captured_at: timestamp,
-            canonical_hash: canonical_hash.clone(),
+            captured_at,
+            canonical_hash: snapshot_hash.clone(),
             rows: rows.clone(),
             location: None,
         };
+
+        let identity = self.doc_store.identity_record();
+        let signer_did = identity.profile.id.clone();
+        let sources = match source {
+            ViewSource::Local => vec![signer_did.clone()],
+        };
+
+        let slug = timestamp_slug(captured_at);
+        let receipt_id = format!(
+            "receipt:{}:{}:{}",
+            sanitize_component(&self.alias),
+            sanitize_component(name),
+            slug
+        );
+
+        let mut receipt = ViewReceipt {
+            id: receipt_id,
+            view: name.to_string(),
+            snapshot_canonical_hash: snapshot_hash.clone(),
+            rows: rows.len(),
+            signer: signer_did,
+            source: sources,
+            merkle_proof: None,
+            captured_at,
+            canonical_hash: String::new(),
+            signature: String::new(),
+            location: None,
+        };
+
+        let canonical_receipt = receipt.canonical_payload()?;
+        receipt.canonical_hash = blake3::hash(canonical_receipt.as_bytes())
+            .to_hex()
+            .to_string();
+        let signature = identity
+            .keys
+            .signing_key()
+            .sign(canonical_receipt.as_bytes());
+        receipt.signature = Base64.encode(signature.to_bytes());
+
         let dir = self.view_dir(name)?;
-        let snap_dir = dir.join("snapshots");
-        fs::create_dir_all(&snap_dir)
-            .with_context(|| format!("failed to create {}", snap_dir.display()))?;
-        let filename = format!("snapshot-{}.json", timestamp.unix_timestamp());
-        let path = snap_dir.join(filename);
-        fs::write(&path, serde_json::to_vec_pretty(&snapshot)?)
-            .with_context(|| format!("failed to write {}", path.display()))?;
-        Ok(ViewSnapshot {
-            location: Some(path),
-            ..snapshot
+        let snapshots_dir = dir.join("snapshots");
+        fs::create_dir_all(&snapshots_dir)
+            .with_context(|| format!("failed to create {}", snapshots_dir.display()))?;
+        let receipts_dir = dir.join("receipts");
+        fs::create_dir_all(&receipts_dir)
+            .with_context(|| format!("failed to create {}", receipts_dir.display()))?;
+
+        let snapshot_path =
+            snapshots_dir.join(format!("snapshot-{}.json", sanitize_component(&slug)));
+        fs::write(&snapshot_path, serde_json::to_vec_pretty(&snapshot)?)
+            .with_context(|| format!("failed to write {}", snapshot_path.display()))?;
+        snapshot.location = Some(snapshot_path);
+
+        let receipt_path = receipts_dir.join(format!("receipt-{}.json", sanitize_component(&slug)));
+        fs::write(&receipt_path, serde_json::to_vec_pretty(&receipt)?)
+            .with_context(|| format!("failed to write {}", receipt_path.display()))?;
+        receipt.location = Some(receipt_path);
+
+        Ok(ViewMaterialization { snapshot, receipt })
+    }
+
+    pub fn verify_receipt(
+        &self,
+        name: &str,
+        receipt_path: Option<&Path>,
+    ) -> Result<ViewVerification> {
+        let receipt = match receipt_path {
+            Some(path) => self.read_receipt_file(path.to_path_buf())?,
+            None => self.latest_receipt(name)?,
+        };
+
+        let verifying_key = self
+            .doc_store
+            .identity_record()
+            .keys
+            .signing_key()
+            .verifying_key();
+        let canonical = receipt.canonical_payload()?;
+        let signature_bytes = Base64
+            .decode(receipt.signature.as_bytes())
+            .context("invalid receipt signature encoding")?;
+        let signature_array: [u8; 64] = signature_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("receipt signature must be 64 bytes"))?;
+        let signature = Signature::from_bytes(&signature_array);
+        let signature_valid = verifying_key
+            .verify_strict(canonical.as_bytes(), &signature)
+            .is_ok();
+
+        let rows = self.run(name)?;
+        let current_canonical = snapshot_canonical_payload(name, &rows, receipt.captured_at)?;
+        let current_hash = blake3::hash(current_canonical.as_bytes())
+            .to_hex()
+            .to_string();
+        let matches_current = current_hash == receipt.snapshot_canonical_hash;
+
+        Ok(ViewVerification {
+            view: name.to_string(),
+            receipt_id: receipt.id.clone(),
+            receipt_path: receipt.location.as_ref().map(|p| p.display().to_string()),
+            signature_valid,
+            recorded_hash: receipt.snapshot_canonical_hash.clone(),
+            current_hash,
+            matches_current,
+            rows_recorded: receipt.rows,
         })
     }
 
@@ -503,6 +654,44 @@ impl<'a> ViewStore<'a> {
 
     fn view_dir(&self, name: &str) -> Result<PathBuf> {
         Ok(self.views_root()?.join(name))
+    }
+
+    fn receipts_dir(&self, name: &str) -> Result<PathBuf> {
+        Ok(self.view_dir(name)?.join("receipts"))
+    }
+
+    fn read_receipt_file(&self, path: PathBuf) -> Result<ViewReceipt> {
+        let data = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+        let mut receipt: ViewReceipt = serde_json::from_slice(&data)
+            .with_context(|| format!("failed to parse {}", path.display()))?;
+        receipt.location = Some(path);
+        Ok(receipt)
+    }
+
+    fn latest_receipt(&self, name: &str) -> Result<ViewReceipt> {
+        self.latest_receipt_optional(name)?
+            .ok_or_else(|| anyhow!("no receipts materialised for view '{name}'"))
+    }
+
+    fn latest_receipt_optional(&self, name: &str) -> Result<Option<ViewReceipt>> {
+        let dir = self.receipts_dir(name)?;
+        if !dir.exists() {
+            return Ok(None);
+        }
+        let mut entries: Vec<_> = fs::read_dir(&dir)
+            .with_context(|| format!("failed to read {}", dir.display()))?
+            .filter_map(|res| res.ok())
+            .filter(|entry| entry.file_type().map(|ft| ft.is_file()).unwrap_or(false))
+            .collect();
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        entries.sort_by_key(|entry| entry.file_name());
+        let path = entries
+            .last()
+            .map(|entry| entry.path())
+            .ok_or_else(|| anyhow!("no receipts materialised for view '{name}'"))?;
+        self.read_receipt_file(path).map(Some)
     }
 
     fn write_definition(&self, dir: &Path, def: &ViewDefinition) -> Result<()> {
@@ -558,6 +747,18 @@ impl ViewRow {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+pub struct ViewSummary {
+    pub name: String,
+    pub rule: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_receipt: Option<ViewReceiptSummary>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ViewSnapshot {
     pub view: String,
     #[serde(with = "time::serde::rfc3339")]
@@ -566,6 +767,116 @@ pub struct ViewSnapshot {
     pub rows: Vec<ViewRow>,
     #[serde(skip)]
     pub location: Option<PathBuf>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ViewReceipt {
+    pub id: String,
+    pub view: String,
+    pub snapshot_canonical_hash: String,
+    pub rows: usize,
+    pub signer: String,
+    pub source: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merkle_proof: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub captured_at: OffsetDateTime,
+    pub canonical_hash: String,
+    pub signature: String,
+    #[serde(skip)]
+    pub location: Option<PathBuf>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ViewReceiptSummary {
+    pub id: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub captured_at: OffsetDateTime,
+    pub canonical_hash: String,
+    pub rows: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ViewMaterialization {
+    pub snapshot: ViewSnapshot,
+    pub receipt: ViewReceipt,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ViewVerification {
+    pub view: String,
+    pub receipt_id: String,
+    pub signature_valid: bool,
+    pub recorded_hash: String,
+    pub current_hash: String,
+    pub matches_current: bool,
+    pub rows_recorded: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receipt_path: Option<String>,
+}
+
+fn snapshot_canonical_payload(
+    view: &str,
+    rows: &[ViewRow],
+    captured_at: OffsetDateTime,
+) -> Result<String> {
+    let sign_view = SnapshotSignView {
+        view,
+        captured_at,
+        rows,
+    };
+    Ok(serde_jcs::to_string(&sign_view)?)
+}
+
+#[derive(Serialize)]
+struct SnapshotSignView<'a> {
+    view: &'a str,
+    #[serde(with = "time::serde::rfc3339")]
+    captured_at: OffsetDateTime,
+    rows: &'a [ViewRow],
+}
+
+impl ViewReceipt {
+    fn canonical_payload(&self) -> Result<String> {
+        let sign_view = ViewReceiptSignView {
+            view: &self.view,
+            snapshot_canonical_hash: &self.snapshot_canonical_hash,
+            rows: self.rows,
+            signer: &self.signer,
+            source: &self.source,
+            merkle_proof: self.merkle_proof.as_ref(),
+            captured_at: self.captured_at,
+        };
+        Ok(serde_jcs::to_string(&sign_view)?)
+    }
+}
+
+#[derive(Serialize)]
+struct ViewReceiptSignView<'a> {
+    view: &'a str,
+    snapshot_canonical_hash: &'a str,
+    rows: usize,
+    signer: &'a str,
+    source: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    merkle_proof: Option<&'a String>,
+    #[serde(with = "time::serde::rfc3339")]
+    captured_at: OffsetDateTime,
+}
+
+impl ViewReceiptSummary {
+    fn from_receipt(receipt: ViewReceipt) -> Self {
+        let file = receipt.location.as_ref().map(|p| p.display().to_string());
+        Self {
+            id: receipt.id,
+            captured_at: receipt.captured_at,
+            canonical_hash: receipt.canonical_hash,
+            rows: receipt.rows,
+            file,
+        }
+    }
 }
 
 struct ViewRule {

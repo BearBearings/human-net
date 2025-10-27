@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use hn_cli::doc::{DocStore, DocSummary, ViewStore};
+use hn_cli::doc::{DocStore, DocSummary, ViewSource, ViewStore};
 use hn_cli::home::ensure_home_dir;
 use hn_cli::identity::IdentityVault;
 use hn_cli::output::{CommandOutput, OutputFormat};
@@ -285,25 +285,43 @@ fn handle_view_snapshot(
     store: &ViewStore,
     name: String,
 ) -> Result<CommandOutput> {
-    let snapshot = store.snapshot(&name)?;
-    let path = snapshot
+    let materialization = store.materialize(&name, ViewSource::Local)?;
+    let snapshot = materialization.snapshot;
+    let receipt = materialization.receipt;
+
+    let snapshot_path = snapshot
         .location
         .as_ref()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
-    let view_name = snapshot.view.clone();
-    let canonical_hash = snapshot.canonical_hash.clone();
+    let receipt_path = receipt
+        .location
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+
     let payload = json!({
-        "view": view_name,
-        "captured_at": snapshot.captured_at,
-        "canonical_hash": canonical_hash,
-        "file": path,
-        "rows": snapshot.rows,
+        "view": snapshot.view,
+        "snapshot": {
+            "captured_at": snapshot.captured_at,
+            "canonical_hash": snapshot.canonical_hash,
+            "file": snapshot_path,
+            "rows": snapshot.rows,
+        },
+        "receipt": {
+            "id": receipt.id,
+            "captured_at": receipt.captured_at,
+            "canonical_hash": receipt.canonical_hash,
+            "signature": receipt.signature,
+            "source": receipt.source,
+            "file": receipt_path,
+        }
     });
     let message = format!(
-        "Snapshot saved for view '{}' (hash {})",
+        "Snapshot saved for view '{}' (hash {}) with receipt {}",
         payload["view"].as_str().unwrap_or(""),
-        payload["canonical_hash"].as_str().unwrap_or("")
+        payload["snapshot"]["canonical_hash"].as_str().unwrap_or(""),
+        payload["receipt"]["file"].as_str().unwrap_or("")
     );
     Ok(CommandOutput::new(message, payload))
 }

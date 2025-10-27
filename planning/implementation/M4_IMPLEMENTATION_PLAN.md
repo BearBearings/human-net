@@ -233,6 +233,28 @@ Exit artifacts:
 
 ---
 
+## Sprint S3 Detail — A1 Assistant
+
+Current state:
+
+- `hn ai` command does not exist; plans are not modelled or signed.
+- No mechanism turns a prompt into structured steps or stores plan artifacts.
+
+Scope breakdown:
+
+- Introduce `plan@1` schema with canonical JSON/signature support.
+- Implement plan storage under `$HN_HOME/plans/<alias>/` plus CLI to generate, list, show, and dry-run plans.
+- Provide a mock backend that converts prompts into deterministic plan steps (offer creation + publish) using explicit CLI parameters for doc and audience.
+- Ensure generated plans are signed by the active identity and verifiable.
+
+Exit artifacts:
+
+- `spec/plan@1.md` with example and signing rules.
+- New `hn ai` CLI with `plan`, `list`, `show`, `dry-run`, `run` commands.
+- Smoke script (`tooling/scripts/m4-s3-test.sh`) proving prompt → plan generation → dry-run pipeline.
+
+---
+
 ## Cross-Cutting Tasks
 
 * Security review: MCP exposure, key rotation, consent gating.
@@ -240,6 +262,7 @@ Exit artifacts:
 * CI: run multi-node simulation (two vaults + one MCP).
 * LLM model licensing and size validation (≤4 GB target).
 * Developer tooling for Synology/NAS deployment.
+* Assistant prompts default to dry-run execution until policy gates are enabled.
 
 ---
 

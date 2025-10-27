@@ -23,6 +23,9 @@ enum Commands {
 
     /// Run the M3 exchange flow (offer → contract → shard replay).
     M3,
+
+    /// Aggregate M4 Reach & Agency smoke tests (S1–S4).
+    M4,
 }
 
 fn main() -> Result<()> {
@@ -30,6 +33,7 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::M1 => run_m1(),
         Commands::M3 => run_m3(),
+        Commands::M4 => run_m4(),
     }
 }
 
@@ -140,6 +144,32 @@ fn run_m3() -> Result<()> {
             status.code()
         ))
     }
+}
+
+fn run_m4() -> Result<()> {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let scripts = [
+        "tooling/scripts/m4-s1-test.sh",
+        "tooling/scripts/m4-s2-test.sh",
+        "tooling/scripts/m4-s3-test.sh",
+        "tooling/scripts/m4-s4-test.sh",
+    ];
+
+    for script in &scripts {
+        let path = repo_root.join(script);
+        println!("→ Running {}", script);
+        let status = Command::new("bash")
+            .arg(&path)
+            .current_dir(&repo_root)
+            .status()
+            .with_context(|| format!("failed to execute {}", path.display()))?;
+        if !status.success() {
+            return Err(anyhow!("{} failed with status {:?}", script, status.code()));
+        }
+    }
+
+    println!("M4 aggregate smoke passed: all S1–S4 scripts succeeded.");
+    Ok(())
 }
 
 fn wait_for_peer(hn: &Path, home: &Path, expected_alias: &str) -> Result<()> {

@@ -5,6 +5,8 @@ pub mod event;
 pub mod home;
 pub mod identity;
 pub mod output;
+pub mod plan;
 pub mod policy;
 pub mod services;
 pub mod shard;
+pub mod sync;
