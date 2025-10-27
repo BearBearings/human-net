@@ -17,6 +17,7 @@ use ureq::{Agent, AgentBuilder, Error as UreqError, Response as UreqResponse};
 use base64::engine::general_purpose::STANDARD as Base64;
 use base64::Engine as _;
 use hn_cli::contract::{merge_metadata, Contract, ShardEnvelope};
+use hn_cli::discovery::{resolve_presence_endpoint, PresenceDoc};
 use hn_cli::doc::{DocStore, StoredDoc};
 use hn_cli::event::ContractEvent;
 use hn_cli::home::ensure_home_dir;
@@ -121,9 +122,13 @@ struct SubscriptionBatch {
     index: Option<Value>,
 }
 
+#[derive(Clone)]
 enum SubscriptionSource {
     Local(PathBuf),
-    Remote(String),
+    Remote {
+        url: String,
+        hint: Option<PresenceDoc>,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -154,6 +159,10 @@ struct SubscribeArgs {
     /// MCP base URL to subscribe from (e.g. https://peer.example.org:7733).
     #[arg(long = "mcp-url", value_name = "URL", conflicts_with = "source")]
     mcp_url: Option<String>,
+
+    /// DID whose presence hint should provide the MCP endpoint.
+    #[arg(long = "presence-did", value_name = "DID", conflicts_with_all = ["source", "mcp_url"])]
+    presence_did: Option<String>,
 
     /// Alias that should import the published data (defaults to active identity).
     #[arg(long = "alias", value_name = "ALIAS")]
@@ -780,19 +789,30 @@ fn handle_subscribe(args: SubscribeArgs) -> Result<CommandOutput> {
     let mut shard_messages = Vec::new();
     let mut index_summaries = Vec::new();
 
-    let source_mode = match (&args.source, &args.mcp_url) {
-        (Some(path), None) => SubscriptionSource::Local(path.clone()),
-        (None, Some(url)) => SubscriptionSource::Remote(url.clone()),
-        (None, None) => {
+    let source_mode = match (&args.source, &args.mcp_url, &args.presence_did) {
+        (Some(path), None, None) => SubscriptionSource::Local(path.clone()),
+        (None, Some(url), None) => SubscriptionSource::Remote {
+            url: url.clone(),
+            hint: None,
+        },
+        (None, None, Some(did)) => {
+            let (doc, url) = resolve_presence_endpoint(&home, did, "mcp")?
+                .ok_or_else(|| anyhow!("no fresh presence hint with MCP endpoint for {did}"))?;
+            SubscriptionSource::Remote {
+                url,
+                hint: Some(doc),
+            }
+        }
+        (None, None, None) => {
             return Err(anyhow!(
-                "provide either --source <PATH> or --mcp-url <URL> to subscribe"
+                "provide --source, --mcp-url, or --presence-did to subscribe"
             ))
         }
-        (Some(_), Some(_)) => unreachable!("clap enforces mutual exclusivity"),
+        _ => unreachable!("clap enforces mutual exclusivity"),
     };
 
     let agent = match &source_mode {
-        SubscriptionSource::Remote(_) => Some(build_http_agent()),
+        SubscriptionSource::Remote { .. } => Some(build_http_agent()),
         SubscriptionSource::Local(_) => None,
     };
 
@@ -806,7 +826,7 @@ fn handle_subscribe(args: SubscribeArgs) -> Result<CommandOutput> {
                 args.no_import,
                 &mut seen,
             )?,
-            SubscriptionSource::Remote(url) => {
+            SubscriptionSource::Remote { url, .. } => {
                 let agent = agent.as_ref().expect("HTTP agent unavailable");
                 let bundle = fetch_mcp_bundle(agent, url)?;
                 process_subscription_iteration(
@@ -849,13 +869,21 @@ fn handle_subscribe(args: SubscribeArgs) -> Result<CommandOutput> {
         )
     };
 
+    let source_json = match &source_mode {
+        SubscriptionSource::Local(path) => json!({"local": path}),
+        SubscriptionSource::Remote { url, hint } => {
+            let mut value = json!({"mcp_url": url});
+            if let Some(doc) = hint {
+                value["presence"] = json!(doc);
+            }
+            value
+        }
+    };
+
     let payload = json!({
         "command": "shard.subscribe",
         "alias": alias,
-        "source": match &source_mode {
-            SubscriptionSource::Local(path) => json!({"local": path}),
-            SubscriptionSource::Remote(url) => json!({"mcp_url": url}),
-        },
+        "source": source_json,
         "processed": {
             "shards": all_shards,
             "contracts": all_contracts,
@@ -1043,19 +1071,21 @@ fn build_http_agent() -> Agent {
 }
 
 fn send_mcp_publish(
-    url: &str,
+    base_url: &str,
     allow_http: bool,
     publisher_did: &str,
     signing_key: &ed25519_dalek::SigningKey,
     request: McpPublishRequest,
 ) -> Result<Value> {
-    if !allow_http && url.starts_with("http://") {
+    if !allow_http && base_url.starts_with("http://") {
         return Err(anyhow!(
             "MCP URL '{}' must use HTTPS (pass --mcp-allow-http for local testing)",
-            url
+            base_url
         ));
     }
 
+    let base = base_url.trim_end_matches('/');
+    let publish_url = format!("{}/publish", base);
     let agent = build_http_agent();
 
     let timestamp = OffsetDateTime::now_utc().unix_timestamp();
@@ -1066,7 +1096,7 @@ fn send_mcp_publish(
     let body = serde_json::to_string(&request)?;
 
     let response = agent
-        .post(url)
+        .post(&publish_url)
         .set("Content-Type", "application/json")
         .set("X-HN-DID", publisher_did)
         .set("X-HN-Timestamp", &timestamp.to_string())
@@ -1086,11 +1116,18 @@ fn send_mcp_publish(
         }
         Err(UreqError::Status(code, resp)) => {
             let body = read_response_body(resp)?;
-            Err(anyhow!("MCP publish rejected (status {}): {}", code, body))
+            Err(anyhow!(
+                "MCP publish rejected by {} (status {}): {}",
+                publish_url,
+                code,
+                body
+            ))
         }
-        Err(UreqError::Transport(err)) => {
-            Err(anyhow!("failed to reach MCP endpoint {}: {}", url, err))
-        }
+        Err(UreqError::Transport(err)) => Err(anyhow!(
+            "failed to reach MCP endpoint {}: {}",
+            publish_url,
+            err
+        )),
     }
 }
 

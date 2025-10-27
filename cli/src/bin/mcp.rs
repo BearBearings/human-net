@@ -58,6 +58,10 @@ struct ServeArgs {
     /// Optional max TTL override in seconds.
     #[arg(long = "max-ttl", value_name = "SECONDS")]
     max_ttl_seconds: Option<u64>,
+
+    /// Path to a presence@2 document served via /presence.
+    #[arg(long = "presence-path", value_name = "PATH")]
+    presence_path: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -130,6 +134,13 @@ async fn serve(args: ServeArgs) -> Result<()> {
     if let Some(ttl) = args.max_ttl_seconds {
         config.max_ttl_seconds = ttl;
     }
+    if let Some(presence) = args.presence_path {
+        config.presence_path = Some(if presence.is_relative() {
+            home.join(presence)
+        } else {
+            presence
+        });
+    }
 
     if !config.storage.exists() {
         fs::create_dir_all(&config.storage).with_context(|| {
@@ -141,10 +152,14 @@ async fn serve(args: ServeArgs) -> Result<()> {
     }
 
     info!(
-        "starting MCP server on {} (mode={}, storage={})",
+        "starting MCP server on {} (mode={}, storage={}, presence_path={:?})",
         config.listen,
         config.mode,
-        config.storage.display()
+        config.storage.display(),
+        config
+            .presence_path
+            .as_ref()
+            .map(|p| p.display().to_string())
     );
 
     let server = McpServer::new(config)?;
@@ -169,6 +184,11 @@ fn read_or_create_config(home: &Path, path: &Path) -> Result<McpConfig> {
             serde_json::from_str(&data).context("MCP config is not valid JSON")?;
         if cfg.storage.is_relative() {
             cfg.storage = home.join(&cfg.storage);
+        }
+        if let Some(presence) = cfg.presence_path.clone() {
+            if presence.is_relative() {
+                cfg.presence_path = Some(home.join(presence));
+            }
         }
         return Ok(cfg);
     }

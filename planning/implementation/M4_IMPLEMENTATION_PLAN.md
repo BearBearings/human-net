@@ -199,12 +199,37 @@ Scope breakdown:
 - Author Synology NAS (DS-series) test plan: cross-compile or deploy via Docker, confirm service start, certificate handling, and shard transfer back to a laptop client.
 - Package a container image recipe (`tooling/docker/hn-mcp.Dockerfile`) and document DSM deployment (`docs/deploy/mcp-synology.md`).
 - Add TLS + DID allowlist configuration to `mcp.json` plus a `hn mcp auth` helper that signs WAN publish requests.
+- Automate end-to-end verification via `tooling/scripts/m4-s1-test.sh`; runs doc → offer → contract → fulfilment → MCP publish/subscribe loop.
 
 Exit artifacts:
 
 - Repeatable `cargo run -p hn-cli -- mcp serve --config mcp.json` demo with two local vaults syncing a shard.
 - Synology deployment notes (`docs/deploy/mcp-synology.md`) plus container recipe for DS deployment.
 - CLI tooling for request signing (`hn mcp auth`) exercised in local + Synology smoke.
+- `m4-s1-test.sh` smoke script producing signed publish + remote subscribe proof.
+
+---
+
+## Sprint S2 Detail — WAN Discovery
+
+Current state:
+
+- Loopback MCP publish/subscribe works (S1); discovery beyond LAN is manual (`--mcp-url`).
+- No schema or CLI support exists for advertising remote vault reachability.
+
+Scope breakdown:
+
+- Define and implement `presence@2` microdoc (DID, endpoints, Merkle root snapshot, expiry).
+- Add CLI commands: `hn discover add|refresh|list`, and persistence under `$HN_HOME/discovery/`.
+- Extend MCP server to serve latest presence and consume friend caches.
+- Implement Merkle proof fetching/validation when pulling remote indices.
+- Update smoke: publish Bob’s presence, have Alice refresh via WAN URL, then `hn shard subscribe --mcp-hint bob`.
+
+Exit artifacts:
+
+- `presence@2` spec + signed doc written under `spec/`.
+- CLI produces cached hints and can show remote reach metadata.
+- Automated smoke (`tooling/scripts/m4-s2-test.sh`) demonstrating Alice discovering Bob’s MCP via presence and fetching remote index over WAN.
 
 ---
 

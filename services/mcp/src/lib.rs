@@ -96,6 +96,8 @@ pub struct McpConfig {
     pub tls: Option<TlsConfig>,
     #[serde(default)]
     pub allow: Vec<PeerConfig>,
+    #[serde(default)]
+    pub presence_path: Option<PathBuf>,
 }
 
 fn default_max_ttl_seconds() -> u64 {
@@ -115,6 +117,7 @@ impl Default for McpConfig {
             storage: default_storage_path(),
             tls: None,
             allow: Vec::new(),
+            presence_path: None,
         }
     }
 }
@@ -158,6 +161,7 @@ struct ServerState {
     storage: Arc<McpStorage>,
     last_index: RwLock<Option<ShardIndex>>,
     allowlist: HashMap<String, VerifyingKey>,
+    presence_path: Option<PathBuf>,
 }
 
 impl ServerState {
@@ -186,6 +190,7 @@ impl McpServer {
             storage,
             last_index: RwLock::new(initial_index),
             allowlist,
+            presence_path: config.presence_path.clone(),
         });
 
         Ok(Self { config, state })
@@ -244,6 +249,7 @@ impl McpServer {
             .route("/healthz", get(healthz_handler))
             .route("/index", get(index_handler))
             .route("/shard/:id", get(shard_handler))
+            .route("/presence", get(presence_handler))
             .route("/artifact/*path", get(artifact_handler))
             .route("/publish", post(publish_handler))
             .layer(Extension(self.state.clone()))
@@ -359,6 +365,35 @@ async fn publish_handler(
         merkle_root: index.merkle_root.clone(),
         entries: index.entries.len(),
     }))
+}
+
+async fn presence_handler(Extension(state): Extension<Arc<ServerState>>) -> Response {
+    let Some(path) = state.presence_path.clone() else {
+        return api_error(StatusCode::NOT_FOUND, "presence not configured");
+    };
+
+    let read = tokio::task::spawn_blocking(move || std::fs::read(&path)).await;
+    let data = match read {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(err)) => {
+            error!(error = %err, "failed to read presence doc");
+            return api_error(StatusCode::NOT_FOUND, "presence document unavailable");
+        }
+        Err(err) => {
+            error!(?err, "presence read task panicked");
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "presence loader worker failed",
+            );
+        }
+    };
+
+    (
+        StatusCode::OK,
+        [(CONTENT_TYPE, HeaderValue::from_static("application/json"))],
+        data,
+    )
+        .into_response()
 }
 
 fn authorize_publish(

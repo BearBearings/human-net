@@ -13,7 +13,7 @@ require_cmd jq
 require_cmd python3
 require_cmd curl
 
-WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/hn-m4-s1-XXXXXX")
+WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/hn-m4-s2-XXXXXX")
 ALICE_HOME="$WORKDIR/alice"
 BOB_HOME="$WORKDIR/bob"
 STORAGE_DIR="$WORKDIR/mcp-storage"
@@ -83,19 +83,12 @@ hn_with_home "$BOB_HOME" id verify --provider mock-didkit
 ALICE_IDENTITY="$ALICE_HOME/identities/alice/identity.json"
 ALICE_DID=$(jq -r '.profile.id' "$ALICE_IDENTITY")
 ALICE_PUB_BASE64=$(decode_multibase_to_base64 "$ALICE_IDENTITY")
-BOB_DID=$(HN_HOME="$BOB_HOME" hn id get --output json | jq -r '.identity.did')
+BOB_IDENTITY="$BOB_HOME/identities/bob/identity.json"
+BOB_DID=$(jq -r '.profile.id' "$BOB_IDENTITY")
 
 echo "→ Creating doc, offer, contract, and fulfilment"
 DOC_RESULT=$(HN_HOME="$ALICE_HOME" hn doc import --type folder@1 --file "$PWD/samples/docs/folder.json" --output json)
-DOC_PATH=$(printf '%s\n' "$DOC_RESULT" | jq -r '.location')
 DOC_ID=$(printf '%s\n' "$DOC_RESULT" | jq -r '.id')
-if [[ -z "$DOC_PATH" || "$DOC_PATH" == "null" ]]; then
-  echo "error: doc import did not return a path" >&2
-  exit 1
-fi
-if [[ "$DOC_PATH" != /* ]]; then
-  DOC_PATH="$ALICE_HOME/$DOC_PATH"
-fi
 
 OFFER_FILE="$WORKDIR/offer.json"
 HN_HOME="$ALICE_HOME" hn contract offer create \
@@ -120,7 +113,7 @@ HN_HOME="$ALICE_HOME" hn contract fulfill \
 SHARD_ID=$(jq -r '.id' "$WORKDIR/shard.json")
 ALICE_SHARD_FILE="$ALICE_HOME/shards/alice/${SHARD_ID//[:\/ ]/_}.json"
 
-cat <<EOF >"$BOB_HOME/mcp.json"
+cat <<EOF2 >"$BOB_HOME/mcp.json"
 {
   "listen": "127.0.0.1:0",
   "mode": "friends",
@@ -133,7 +126,7 @@ cat <<EOF >"$BOB_HOME/mcp.json"
     }
   ]
 }
-EOF
+EOF2
 
 echo "→ Selecting loopback port"
 if PORT=$(python3 - <<'PY'
@@ -150,42 +143,92 @@ else
   PORT=7733
 fi
 
-echo "→ Launching MCP server on port $PORT"
-(
-  export HN_HOME="$BOB_HOME"
-  hn mcp serve --config "$BOB_HOME/mcp.json" --listen "127.0.0.1:$PORT"
-) >"$MCP_LOG" 2>&1 &
-MCP_PID=$!
-
-for _ in $(seq 1 50); do
-  if curl -sf "http://127.0.0.1:$PORT/healthz" >/dev/null; then
-    break
-  fi
-  sleep 0.2
-done
-
-if ! curl -sf "http://127.0.0.1:$PORT/healthz" >/dev/null; then
+start_mcp() {
+  local presence_path=$1
+  (
+    export HN_HOME="$BOB_HOME"
+    if [[ -n "$presence_path" ]]; then
+      hn mcp serve --config "$BOB_HOME/mcp.json" --listen "127.0.0.1:$PORT" --presence-path "$presence_path"
+    else
+      hn mcp serve --config "$BOB_HOME/mcp.json" --listen "127.0.0.1:$PORT"
+    fi
+  ) >"$MCP_LOG" 2>&1 &
+  MCP_PID=$!
+  for _ in $(seq 1 50); do
+    if curl -sf "http://127.0.0.1:$PORT/healthz" >/dev/null; then
+      return 0
+    fi
+    sleep 0.2
+  done
   echo "error: MCP server failed to start (see $MCP_LOG)" >&2
+  exit 1
+}
+
+stop_mcp() {
+  if [[ -n "${MCP_PID:-}" ]]; then
+    kill "$MCP_PID" >/dev/null 2>&1 || true
+    wait "$MCP_PID" >/dev/null 2>&1 || true
+    unset MCP_PID
+  fi
+}
+
+echo "→ Seeding publish bundle locally"
+LOCAL_PUBLISH_JSON=$(HN_HOME="$ALICE_HOME" hn shard publish \
+  --target "$PUBLISH_DIR" \
+  --alias alice \
+  --output json)
+printf '%s\n' "$LOCAL_PUBLISH_JSON" | jq -e '.counts.shards == 1' >/dev/null
+MERKLE_ROOT=$(printf '%s\n' "$LOCAL_PUBLISH_JSON" | jq -r '.index.merkle_root')
+
+echo "→ Publishing presence for bob"
+PRESENCE_JSON=$(HN_HOME="$BOB_HOME" hn discover publish \
+  --alias bob \
+  --merkle-root "$MERKLE_ROOT" \
+  --ttl-seconds 600 \
+  --endpoint "mcp=http://127.0.0.1:$PORT" \
+  --endpoint "presence=http://127.0.0.1:$PORT/presence" \
+  --output json)
+PRESENCE_PATH=$(printf '%s\n' "$PRESENCE_JSON" | jq -r '.path')
+
+if [[ ! -f "$PRESENCE_PATH" ]]; then
+  echo "error: presence document not found at $PRESENCE_PATH" >&2
   exit 1
 fi
 
+echo "→ Launching MCP server"
+start_mcp "$PRESENCE_PATH"
+
 echo "→ Publishing shard bundle via MCP"
-PUBLISH_JSON=$(HN_HOME="$ALICE_HOME" hn shard publish \
+REMOTE_PUBLISH_JSON=$(HN_HOME="$ALICE_HOME" hn shard publish \
   --target "$PUBLISH_DIR" \
   --alias alice \
   --mcp-url "http://127.0.0.1:$PORT" \
   --mcp-allow-http \
   --output json)
-printf '%s\n' "$PUBLISH_JSON" | jq -e '.counts.shards == 1' >/dev/null
-printf '%s\n' "$PUBLISH_JSON" | jq -e '.mcp.response.accepted == true' >/dev/null
+printf '%s\n' "$REMOTE_PUBLISH_JSON" | jq -e '.counts.shards == 1' >/dev/null
+printf '%s\n' "$REMOTE_PUBLISH_JSON" | jq -e '.mcp.response.accepted == true' >/dev/null
 
-echo "→ Subscribing from MCP as bob"
+echo "→ Refreshing presence from server"
+REFRESH_JSON=$(HN_HOME="$ALICE_HOME" hn discover refresh \
+  --did "$BOB_DID" \
+  --url "http://127.0.0.1:$PORT/presence" \
+  --output json)
+printf '%s\n' "$REFRESH_JSON" | jq -e '.presence.did == "'$BOB_DID'"' >/dev/null
+
+HINTS_COUNT=$(HN_HOME="$ALICE_HOME" hn discover list --hints --output json | jq '.presence | length')
+if [[ "$HINTS_COUNT" -lt 1 ]]; then
+  echo "error: expected presence hint to be stored" >&2
+  exit 1
+fi
+
+echo "→ Subscribing from MCP using presence"
 SUBSCRIBE_JSON=$(HN_HOME="$BOB_HOME" hn shard subscribe \
-  --mcp-url "http://127.0.0.1:$PORT" \
+  --presence-did "$BOB_DID" \
   --alias bob \
   --no-import \
   --output json)
 printf '%s\n' "$SUBSCRIBE_JSON" | jq -e '.processed.shards | length == 1' >/dev/null
+printf '%s\n' "$SUBSCRIBE_JSON" | jq -e '.source.presence.did == "'$BOB_DID'"' >/dev/null
 
 EXPECTED_SHARD="$BOB_HOME/shards/bob/${SHARD_ID//[:\/ ]/_}.json"
 if [[ ! -f "$EXPECTED_SHARD" ]]; then
@@ -198,4 +241,4 @@ if ! diff -q "$ALICE_SHARD_FILE" "$EXPECTED_SHARD" >/dev/null; then
   exit 1
 fi
 
-echo "✔ M4 S1 smoke test completed successfully"
+echo "✔ M4 S2 smoke test completed successfully"
