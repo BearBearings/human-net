@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "cli",
-  "services/discovery"
+  "services/discovery",
+  "services/mcp"
 ]
 resolver = "2"

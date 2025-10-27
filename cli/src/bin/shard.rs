@@ -1,15 +1,21 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand};
-use serde::Serialize;
+use ed25519_dalek::Signer;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tempfile::TempDir;
 use time::OffsetDateTime;
+use ureq::{Agent, AgentBuilder, Error as UreqError, Response as UreqResponse};
 
+use base64::engine::general_purpose::STANDARD as Base64;
+use base64::Engine as _;
 use hn_cli::contract::{merge_metadata, Contract, ShardEnvelope};
 use hn_cli::doc::{DocStore, StoredDoc};
 use hn_cli::event::ContractEvent;
@@ -18,6 +24,10 @@ use hn_cli::identity::IdentityVault;
 use hn_cli::output::{CommandOutput, OutputFormat};
 use hn_cli::shard::{
     compute_merkle_root, create_index, create_receipt, ShardIndex, ShardIndexEntry, ShardReceipt,
+};
+use hn_mcp::{
+    canonical_body_hash, canonical_request_message, PublishArtifact as McpPublishArtifact,
+    PublishRequest as McpPublishRequest, ShardIndex as McpShardIndex,
 };
 
 #[derive(Parser, Debug)]
@@ -111,6 +121,11 @@ struct SubscriptionBatch {
     index: Option<Value>,
 }
 
+enum SubscriptionSource {
+    Local(PathBuf),
+    Remote(String),
+}
+
 #[derive(Args, Debug)]
 struct PublishArgs {
     /// Destination directory where shard bundles will be written.
@@ -120,13 +135,25 @@ struct PublishArgs {
     /// Alias to publish (defaults to active identity).
     #[arg(long = "alias", value_name = "ALIAS")]
     alias: Option<String>,
+
+    /// Optional MCP base URL to POST the publish payload (e.g. https://peer.example.org:7733).
+    #[arg(long = "mcp-url", value_name = "URL")]
+    mcp_url: Option<String>,
+
+    /// Allow HTTP (no TLS) when using --mcp-url (for local testing only).
+    #[arg(long = "mcp-allow-http")]
+    mcp_allow_http: bool,
 }
 
 #[derive(Args, Debug)]
 struct SubscribeArgs {
     /// Source directory published by a peer.
-    #[arg(long = "source", value_name = "PATH")]
-    source: PathBuf,
+    #[arg(long = "source", value_name = "PATH", conflicts_with = "mcp_url")]
+    source: Option<PathBuf>,
+
+    /// MCP base URL to subscribe from (e.g. https://peer.example.org:7733).
+    #[arg(long = "mcp-url", value_name = "URL", conflicts_with = "source")]
+    mcp_url: Option<String>,
 
     /// Alias that should import the published data (defaults to active identity).
     #[arg(long = "alias", value_name = "ALIAS")]
@@ -538,6 +565,9 @@ fn handle_publish(args: PublishArgs) -> Result<CommandOutput> {
     fs::create_dir_all(&target_events)?;
     fs::create_dir_all(&target_contracts)?;
 
+    let collect_for_mcp = args.mcp_url.is_some();
+    let mut mcp_artifacts: Vec<McpPublishArtifact> = Vec::new();
+
     let mut index_entries = Vec::new();
     let mut shard_count = 0usize;
     let mut event_count = 0usize;
@@ -567,6 +597,10 @@ fn handle_publish(args: PublishArgs) -> Result<CommandOutput> {
                 if let Some(shard_id) = meta.get("shard_id").and_then(|v| v.as_str()) {
                     event_by_shard.insert(shard_id.to_string(), event.id.clone());
                 }
+            }
+            if collect_for_mcp {
+                let relative_path = format!("events/{}", file_name.to_string_lossy());
+                mcp_artifacts.push(artifact_from_path(&relative_path, &entry.path())?);
             }
             index_entries.push(ShardIndexEntry {
                 kind: "event".to_string(),
@@ -601,6 +635,10 @@ fn handle_publish(args: PublishArgs) -> Result<CommandOutput> {
                     target_path.display()
                 )
             })?;
+            if collect_for_mcp {
+                let relative_path = format!("contracts/{}", file_name.to_string_lossy());
+                mcp_artifacts.push(artifact_from_path(&relative_path, &entry.path())?);
+            }
             index_entries.push(ShardIndexEntry {
                 kind: "contract".to_string(),
                 id: contract.id.clone(),
@@ -640,6 +678,10 @@ fn handle_publish(args: PublishArgs) -> Result<CommandOutput> {
                 "payload_cid": shard.payload_cid,
                 "event_id": event_id,
             });
+            if collect_for_mcp {
+                let relative_path = format!("shards/{}", file_name.to_string_lossy());
+                mcp_artifacts.push(artifact_from_path(&relative_path, &entry.path())?);
+            }
             index_entries.push(ShardIndexEntry {
                 kind: "shard".to_string(),
                 id: shard.id.clone(),
@@ -655,6 +697,26 @@ fn handle_publish(args: PublishArgs) -> Result<CommandOutput> {
     let index = create_index(&publisher_did, signing_key, generated_at, index_entries)?;
     index.verify_signature()?;
     write_json(&target.join("index.json"), &index)?;
+
+    let mut mcp_upload: Option<Value> = None;
+    let mut mcp_url_used: Option<String> = None;
+    if let Some(ref mcp_url) = args.mcp_url {
+        let index_value = serde_json::to_value(&index)?;
+        let mcp_index: McpShardIndex = serde_json::from_value(index_value)?;
+        let request = McpPublishRequest {
+            index: mcp_index,
+            artifacts: mcp_artifacts,
+        };
+        let response = send_mcp_publish(
+            mcp_url,
+            args.mcp_allow_http,
+            &publisher_did,
+            signing_key,
+            request,
+        )?;
+        mcp_url_used = Some(mcp_url.clone());
+        mcp_upload = Some(response);
+    }
 
     let message = format!(
         "Published {} shard(s), {} contract(s), {} event(s) for alias '{}' (index={}, merkle={})",
@@ -675,10 +737,22 @@ fn handle_publish(args: PublishArgs) -> Result<CommandOutput> {
             "generated_at": index.generated_at,
             "merkle_root": index.merkle_root,
             "canonical_hash": index.canonical_hash,
-        }
+        },
+        "mcp": mcp_upload.as_ref().and_then(|response| {
+            mcp_url_used.as_ref().map(|url| json!({
+                "url": url,
+                "response": response
+            }))
+        })
     });
 
-    Ok(CommandOutput::new(message, payload))
+    let final_message = if let (Some(url), Some(_)) = (&mcp_url_used, &mcp_upload) {
+        format!("{}\nMCP publish accepted by {}", message, url)
+    } else {
+        message
+    };
+
+    Ok(CommandOutput::new(final_message, payload))
 }
 
 fn handle_subscribe(args: SubscribeArgs) -> Result<CommandOutput> {
@@ -706,15 +780,45 @@ fn handle_subscribe(args: SubscribeArgs) -> Result<CommandOutput> {
     let mut shard_messages = Vec::new();
     let mut index_summaries = Vec::new();
 
+    let source_mode = match (&args.source, &args.mcp_url) {
+        (Some(path), None) => SubscriptionSource::Local(path.clone()),
+        (None, Some(url)) => SubscriptionSource::Remote(url.clone()),
+        (None, None) => {
+            return Err(anyhow!(
+                "provide either --source <PATH> or --mcp-url <URL> to subscribe"
+            ))
+        }
+        (Some(_), Some(_)) => unreachable!("clap enforces mutual exclusivity"),
+    };
+
+    let agent = match &source_mode {
+        SubscriptionSource::Remote(_) => Some(build_http_agent()),
+        SubscriptionSource::Local(_) => None,
+    };
+
     for iteration in 0..iterations {
-        let batch = process_subscription_iteration(
-            &vault,
-            &home,
-            &alias,
-            &args.source,
-            args.no_import,
-            &mut seen,
-        )?;
+        let batch = match &source_mode {
+            SubscriptionSource::Local(path) => process_subscription_iteration(
+                &vault,
+                &home,
+                &alias,
+                path,
+                args.no_import,
+                &mut seen,
+            )?,
+            SubscriptionSource::Remote(url) => {
+                let agent = agent.as_ref().expect("HTTP agent unavailable");
+                let bundle = fetch_mcp_bundle(agent, url)?;
+                process_subscription_iteration(
+                    &vault,
+                    &home,
+                    &alias,
+                    bundle.path(),
+                    args.no_import,
+                    &mut seen,
+                )?
+            }
+        };
         shard_messages.extend(batch.shard_messages.iter().cloned());
         all_events.extend(batch.events);
         all_contracts.extend(batch.contracts);
@@ -748,7 +852,10 @@ fn handle_subscribe(args: SubscribeArgs) -> Result<CommandOutput> {
     let payload = json!({
         "command": "shard.subscribe",
         "alias": alias,
-        "source": args.source,
+        "source": match &source_mode {
+            SubscriptionSource::Local(path) => json!({"local": path}),
+            SubscriptionSource::Remote(url) => json!({"mcp_url": url}),
+        },
         "processed": {
             "shards": all_shards,
             "contracts": all_contracts,
@@ -929,6 +1036,129 @@ fn handle_verify(args: VerifyArgs) -> Result<CommandOutput> {
     });
 
     Ok(CommandOutput::new(message, payload))
+}
+
+fn build_http_agent() -> Agent {
+    AgentBuilder::new().timeout(Duration::from_secs(30)).build()
+}
+
+fn send_mcp_publish(
+    url: &str,
+    allow_http: bool,
+    publisher_did: &str,
+    signing_key: &ed25519_dalek::SigningKey,
+    request: McpPublishRequest,
+) -> Result<Value> {
+    if !allow_http && url.starts_with("http://") {
+        return Err(anyhow!(
+            "MCP URL '{}' must use HTTPS (pass --mcp-allow-http for local testing)",
+            url
+        ));
+    }
+
+    let agent = build_http_agent();
+
+    let timestamp = OffsetDateTime::now_utc().unix_timestamp();
+    let body_hash = canonical_body_hash(&request)?;
+    let message = canonical_request_message("POST", "/publish", timestamp, &body_hash);
+    let signature = signing_key.sign(message.as_bytes());
+    let signature_b64 = Base64.encode(signature.to_bytes());
+    let body = serde_json::to_string(&request)?;
+
+    let response = agent
+        .post(url)
+        .set("Content-Type", "application/json")
+        .set("X-HN-DID", publisher_did)
+        .set("X-HN-Timestamp", &timestamp.to_string())
+        .set("X-HN-Signature", &signature_b64)
+        .set("Digest", &format!("blake3={}", body_hash))
+        .send_string(&body);
+
+    match response {
+        Ok(resp) => {
+            let body = read_response_body(resp)?;
+            if body.trim().is_empty() {
+                Ok(json!({ "status": "ok" }))
+            } else {
+                serde_json::from_str(&body)
+                    .map_err(|err| anyhow!("failed to parse MCP response JSON: {err}; body={body}"))
+            }
+        }
+        Err(UreqError::Status(code, resp)) => {
+            let body = read_response_body(resp)?;
+            Err(anyhow!("MCP publish rejected (status {}): {}", code, body))
+        }
+        Err(UreqError::Transport(err)) => {
+            Err(anyhow!("failed to reach MCP endpoint {}: {}", url, err))
+        }
+    }
+}
+
+fn artifact_from_path(relative_path: &str, source_path: &Path) -> Result<McpPublishArtifact> {
+    let data = fs::read(source_path)
+        .with_context(|| format!("failed to read artifact at {}", source_path.display()))?;
+    Ok(McpPublishArtifact {
+        path: relative_path.to_string(),
+        content: Base64.encode(&data),
+    })
+}
+
+fn read_response_body(response: UreqResponse) -> Result<String> {
+    let mut buffer = String::new();
+    response
+        .into_reader()
+        .read_to_string(&mut buffer)
+        .context("failed to read MCP response body")?;
+    Ok(buffer)
+}
+
+fn fetch_mcp_bundle(agent: &Agent, base_url: &str) -> Result<TempDir> {
+    let base = base_url.trim_end_matches('/');
+    let index_url = format!("{}/index", base);
+    let index_resp = agent
+        .get(&index_url)
+        .call()
+        .map_err(|err| anyhow!("failed to fetch MCP index from {}: {}", index_url, err))?;
+    let index_body = read_response_body(index_resp)?;
+    let remote: RemoteIndexResponse =
+        serde_json::from_str(&index_body).context("failed to parse MCP index response")?;
+    let index = remote
+        .index
+        .ok_or_else(|| anyhow!("MCP node has no published index yet"))?;
+
+    let temp_dir = TempDir::new().context("failed to allocate temporary directory")?;
+    let index_path = temp_dir.path().join("index.json");
+    write_json(&index_path, &index)?;
+
+    for entry in &index.entries {
+        let artifact_url = format!("{}/artifact/{}", base, entry.path);
+        let resp = agent.get(&artifact_url).call().map_err(|err| {
+            anyhow!(
+                "failed to fetch MCP artifact '{}' from {}: {}",
+                entry.path,
+                artifact_url,
+                err
+            )
+        })?;
+        let mut bytes = Vec::new();
+        resp.into_reader()
+            .read_to_end(&mut bytes)
+            .context("failed to read artifact body")?;
+        let destination = temp_dir.path().join(&entry.path);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create temp directory {}", parent.display()))?;
+        }
+        fs::write(&destination, &bytes)
+            .with_context(|| format!("failed to write artifact to {}", destination.display()))?;
+    }
+
+    Ok(temp_dir)
+}
+
+#[derive(Deserialize)]
+struct RemoteIndexResponse {
+    index: Option<ShardIndex>,
 }
 
 fn process_subscription_iteration(

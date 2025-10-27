@@ -182,6 +182,32 @@ An A1 assistant compiles the user’s natural command (“Offer my bike for 50 �
 
 ---
 
+## Sprint S1 Detail — MCP Base
+
+Current state:
+
+- `services/discovery` already ships the LAN discovery daemon (`hn-discovery`) that broadcasts and tracks peers over mDNS. WAN discovery remains future work for S2.
+- `services/mcp` now carries the embedded MCP server scaffolding and the CLI exposes it via `hn mcp serve`.
+
+Scope breakdown:
+
+- Scaffold the embedded MCP server crate (`hn-mcp`) with async runtime, config loader, and TLS scaffolding.
+- Implement minimum endpoints: `GET /healthz`, `GET /index`, `GET /shard/:id`, `POST /publish`; log structured events for digest comparisons.
+- Add `mcp.json` parsing to the CLI, wiring `hn mcp serve` to start the embedded server with policy gating hooks.
+- Reuse the existing LAN discovery peer table to seed initial reachability hints while WAN discovery is unavailable.
+- Write local smoke: run two vaults on a MacBook Pro, publish shards over localhost HTTPS, verify Merkle roots match.
+- Author Synology NAS (DS-series) test plan: cross-compile or deploy via Docker, confirm service start, certificate handling, and shard transfer back to a laptop client.
+- Package a container image recipe (`tooling/docker/hn-mcp.Dockerfile`) and document DSM deployment (`docs/deploy/mcp-synology.md`).
+- Add TLS + DID allowlist configuration to `mcp.json` plus a `hn mcp auth` helper that signs WAN publish requests.
+
+Exit artifacts:
+
+- Repeatable `cargo run -p hn-cli -- mcp serve --config mcp.json` demo with two local vaults syncing a shard.
+- Synology deployment notes (`docs/deploy/mcp-synology.md`) plus container recipe for DS deployment.
+- CLI tooling for request signing (`hn mcp auth`) exercised in local + Synology smoke.
+
+---
+
 ## Cross-Cutting Tasks
 
 * Security review: MCP exposure, key rotation, consent gating.
@@ -209,4 +235,3 @@ An A1 assistant compiles the user’s natural command (“Offer my bike for 50 �
 * Docs/specs complete with examples for all new schemas.
 * Two-actor + assistant demo reproducible on local + WAN setup.
 * All open security items logged for M5 federation milestone.
-
