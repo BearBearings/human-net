@@ -20,3 +20,9 @@ time = { version = "0.3", features = ["serde", "macros"] }
 tokio = { version = "1.36", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+libp2p = { version = "0.54", default-features = false, features = ["tcp", "dns", "identify", "kad", "tokio", "noise", "yamux", "macros"] }
+multiaddr = "0.18"
+rand = "0.8"
+serde_jcs = "0.1"
+toml = "0.8"
+web-time = "0.2"

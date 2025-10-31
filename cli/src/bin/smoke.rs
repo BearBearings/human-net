@@ -19,13 +19,20 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Validate the M1 identity + discovery flow (Alice/Bob LAN discovery).
+    #[command(alias = "M1")]
     M1,
 
     /// Run the M3 exchange flow (offer → contract → shard replay).
+    #[command(alias = "M3")]
     M3,
 
     /// Aggregate M4 Reach & Agency smoke tests (S1–S4).
+    #[command(alias = "M4")]
     M4,
+
+    /// Exercise the M5 local federation flow (multi-node DHT + MCP).
+    #[command(name = "m5", alias = "M5")]
+    M5,
 }
 
 fn main() -> Result<()> {
@@ -34,6 +41,7 @@ fn main() -> Result<()> {
         Commands::M1 => run_m1(),
         Commands::M3 => run_m3(),
         Commands::M4 => run_m4(),
+        Commands::M5 => run_m5(),
     }
 }
 
@@ -170,6 +178,29 @@ fn run_m4() -> Result<()> {
 
     println!("M4 aggregate smoke passed: all S1–S4 scripts succeeded.");
     Ok(())
+}
+
+fn run_m5() -> Result<()> {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let script = repo_root.join("tooling/scripts/m5-smoke.sh");
+    if !script.exists() {
+        return Err(anyhow!(
+            "m5 smoke script not found at {}; please update tooling/scripts/m5-smoke.sh",
+            script.display()
+        ));
+    }
+    println!("→ Running {}", script.display());
+    let status = Command::new("bash")
+        .arg(&script)
+        .current_dir(&repo_root)
+        .status()
+        .with_context(|| format!("failed to execute {}", script.display()))?;
+    if status.success() {
+        println!("M5 local federation smoke passed.");
+        Ok(())
+    } else {
+        Err(anyhow!("m5 smoke failed with status {:?}", status.code()))
+    }
 }
 
 fn wait_for_peer(hn: &Path, home: &Path, expected_alias: &str) -> Result<()> {

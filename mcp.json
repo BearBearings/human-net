@@ -1,0 +1,12 @@
+{
+  "listen": "0.0.0.0:7733",
+  "mode": "friends",
+  "max_ttl_seconds": 604800,
+  "storage": "/Users/bjoernheismann/Development/human-net/mcp/storage",
+  "tls": null,
+  "allow": [],
+  "presence_path": null,
+  "public_url": null,
+  "trust_path": "/Users/bjoernheismann/Development/human-net/trust",
+  "relay_ttl_seconds": 900
+}

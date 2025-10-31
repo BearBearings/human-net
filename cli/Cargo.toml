@@ -33,3 +33,12 @@ tokio = { version = "1.37", features = ["rt-multi-thread", "macros"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 hn-mcp = { path = "../services/mcp" }
+toml = "0.8"
+tar = "0.4"
+zstd = "0.13"
+walkdir = "2.4"
+url = "2.5"
+
+[dev-dependencies]
+assert_cmd = "2.0"
+predicates = "3.1"

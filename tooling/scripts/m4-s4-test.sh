@@ -60,10 +60,10 @@ printf '%s\n' "$VERIFY_JSON" | jq -e '.signature_valid == true' >/dev/null
 printf '%s\n' "$VERIFY_JSON" | jq -e '.matches_current == true' >/dev/null
 
 echo "→ Exporting identity bundle"
-HN_HOME="$PRIMARY_HOME" hn id export alice --file "$BUNDLE_FILE" --password passphrase >/dev/null
+HN_HOME="$PRIMARY_HOME" hn id export alice --file "$BUNDLE_FILE" --password passphrase --yes >/dev/null
 
 echo "→ Recovering identity on secondary device"
-hn_with_home "$SECONDARY_HOME" id recover "$BUNDLE_FILE" --password passphrase --alias alice >/dev/null
+hn_with_home "$SECONDARY_HOME" id recover "$BUNDLE_FILE" --password passphrase --alias alice --yes >/dev/null
 hn_with_home "$SECONDARY_HOME" id use alice
 
 echo "→ Pairing primary and secondary vaults"

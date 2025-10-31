@@ -10,3 +10,4 @@ pub mod policy;
 pub mod services;
 pub mod shard;
 pub mod sync;
+pub mod trust;

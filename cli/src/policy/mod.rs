@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::identity::IdentityVault;
+use crate::trust::TrustLinkStore;
 
 const POLICY_FILE: &str = "policy@1.json";
 const POLICY_LOG: &str = "log.jsonl";
@@ -196,6 +197,29 @@ impl PolicyEvaluator {
         match store.evaluate_provider_gate(gate, provider)? {
             PolicyDecision::Allow => Ok(()),
             PolicyDecision::Deny(reason) => Err(anyhow!(reason)),
+        }
+    }
+
+    pub fn check_trust_threshold(
+        vault: &IdentityVault,
+        alias: &str,
+        target: &str,
+        min_confidence: f64,
+        min_links: usize,
+        context: Option<String>,
+    ) -> Result<()> {
+        if !(0.0..=1.0).contains(&min_confidence) {
+            return Err(anyhow!("min_confidence must be between 0 and 1"));
+        }
+        let store = TrustLinkStore::for_alias(vault, alias)?;
+        let reputation = store.compute_reputation(target, None, context, Some(min_links))?;
+        if reputation.aggregate.avg_confidence < min_confidence {
+            Err(anyhow!(format!(
+                "trust threshold failed: avg_confidence {:.3} < required {:.3}",
+                reputation.aggregate.avg_confidence, min_confidence
+            )))
+        } else {
+            Ok(())
         }
     }
 }
